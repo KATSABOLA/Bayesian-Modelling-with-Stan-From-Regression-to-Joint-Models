@@ -1,0 +1,970 @@
+---
+title: "Session 0 Practical: Introduction to Stan and cmdstanr"
+subtitle: "Bayesian Joint Modelling Training 2026"
+author: "Hillary Katsabola"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    theme: flatly
+    highlight-style: github
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  cache: false
+---
+
+## Overview
+
+In this practical you will fit seven progressively richer Bayesian models in Stan,
+all framed around HIV clinical questions. By the end you will be able to:
+
+1. Fit a **Binomial model** (viral suppression trial) — single-parameter posterior
+2. Fit a **Normal model (two unknowns)** (CD4 recovery — mean and SD) — joint posterior, PPC
+3. Fit a **Simple Linear Regression** (CD4 count vs ART duration) — slope, PPC, LOO
+4. Fit a **Multiple Linear Regression** (ART adherence vs sex + CD4) — multi-predictor, PPC
+5. Fit a **Binomial Logistic Regression** (suppression counts per patient) — logit link, Binomial likelihood, PPC on proportions
+6. Fit a **Logistic Regression** (per-visit binary suppression) — Bernoulli likelihood, counselling effect, grouped PPC
+7. Fit a **Poisson Regression** (clinic visit counts) — log link, rootogram PPC, overdispersion check
+
+All Stan model files live in `stan/`. Data for Models 1–4 are in `data/`.
+Data for Models 5–7 are read from `data/` CSV files.
+
+---
+
+## Setup
+
+```{r setup}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(loo)
+library(tidyverse)
+
+# Colour palette for plots (SU brand approximation)
+color_scheme_set("teal")
+
+# Verify Stan installation
+check_cmdstan_toolchain(quiet = TRUE)
+cat("CmdStan version:", cmdstan_version(), "\n")
+```
+
+---
+
+## Part 1: Binomial Model — Viral Suppression Trial
+
+### Clinical question
+
+In a small pilot trial, $N = 30$ HIV patients start a new first-line ART regimen.
+After 12 months, $y = 20$ achieve viral suppression (VL $< 1000$ copies/mL).
+What is the probability $\theta$ of suppression on this regimen?
+
+**Model:**
+$$y \mid \theta \sim \text{Binomial}(N,\, \theta), \qquad \theta \sim \text{Beta}(2, 2)$$
+
+The Beta(2,2) prior is weakly informative — it places most mass away from 0 and 1
+while remaining sceptical of extreme suppression rates.
+
+### Stan model
+
+The model lives in `stan/binomial_coin.stan`:
+
+```stan
+// stan/binomial_coin.stan
+data {
+  int<lower=0> N;                // number of patients
+  int<lower=0> n_suppressed;     // number with viral suppression at 12 months
+}
+parameters {
+  real<lower=0, upper=1> theta;   // suppression probability
+}
+model {
+  theta        ~ beta(2, 2);
+  n_suppressed ~ binomial(N, theta);
+}
+generated quantities {
+  int y_rep = binomial_rng(N, theta);
+}
+```
+
+### Compile and fit
+
+```{r binomial-fit}
+mod_bin <- cmdstan_model("../stan/binomial_coin.stan")
+
+fit_bin <- mod_bin$sample(
+  data    = list(N = 30L, n_suppressed = 20L),
+  seed    = 42,
+  chains  = 4,
+  refresh = 0
+)
+```
+
+### Summarise
+
+```{r binomial-summary}
+fit_bin$summary("theta")
+```
+
+**Question 1.1:** What is the posterior mean of $\theta$?
+Is there strong evidence that suppression exceeds 50%?
+
+**Question 1.2:** Report the 90% credible interval. Does it include 0.5?
+
+### Visualise the posterior
+
+```{r binomial-plot}
+draws_bin <- fit_bin$draws()
+
+mcmc_areas(draws_bin, pars = "theta", prob = 0.90) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", colour = "red") +
+  labs(title    = "Posterior of \u03b8: Viral Suppression Probability",
+       subtitle = "Dashed line = 50% suppression rate",
+       x = expression(theta))
+```
+
+### Posterior predictive check
+
+```{r binomial-ppc}
+y_rep_bin <- as.vector(fit_bin$draws("y_rep", format = "matrix"))
+
+tibble(y_rep = y_rep_bin) |>
+  ggplot(aes(x = y_rep)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = 20, colour = "red", linewidth = 1.2) +
+  labs(title    = "Posterior Predictive Check: Binomial",
+       subtitle = "Red line = observed y = 20 suppressed",
+       x = "y_rep (simulated suppressed patients out of 30)",
+       y = "Count")
+```
+
+**Question 1.3:** Does $y = 20$ fall in the bulk of the predictive distribution?
+
+---
+
+## Part 2: Normal Model — Two Unknown Parameters (CD4 Recovery)
+
+### Clinical question
+
+After starting ART, CD4 counts recover. We want to estimate the **mean CD4 recovery**
+($\mu$) and its **patient-to-patient variability** ($\sigma$) at 6 months, without
+any covariate. This is the two-parameter Normal model from Matsuura (2022, Chapter 3,
+extended to two unknowns).
+
+**Model:**
+$$Y_n \sim \mathcal{N}(\mu,\, \sigma), \qquad n = 1, \ldots, N$$
+
+Both $\mu$ and $\sigma$ are unknown. In Stan, $\sigma$ is constrained to be positive
+via `real<lower=0> sigma` in the `parameters` block.
+
+**Stan model:** `stan/model_normal2.stan`
+
+### Simulate data
+
+We generate $N = 20$ synthetic CD4/100 values representing a realistic 6-month
+post-ART recovery distribution ($\mu \approx 0.9$, $\sigma \approx 0.3$):
+
+```{r norm2-data}
+set.seed(42)
+N_n2   <- 20L
+cd4_6m <- rnorm(N_n2, mean = 0.9, sd = 0.3)
+
+cat("N patients:", N_n2, "\n")
+cat("Mean CD4/100:", round(mean(cd4_6m), 3), "\n")
+cat("SD CD4/100:", round(sd(cd4_6m), 3), "\n")
+
+tibble(cd4 = cd4_6m) |>
+  ggplot(aes(x = cd4)) +
+  geom_histogram(bins = 10, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = mean(cd4_6m), colour = "red", linewidth = 1) +
+  labs(title    = "CD4/100 at 6 Months Post-ART",
+       subtitle = "N = 20 simulated patients; red line = sample mean",
+       x = "CD4 count / 100 (cells/100 \u03bcL)",
+       y = "Count")
+```
+
+### Compile and fit
+
+```{r norm2-compile}
+mod_n2 <- cmdstan_model("../stan/model_normal2.stan")
+```
+
+```{r norm2-fit}
+stan_n2 <- list(N = N_n2, cd4_6m = cd4_6m)
+
+fit_n2 <- mod_n2$sample(
+  data    = stan_n2,
+  seed    = 123,
+  chains  = 4,
+  refresh = 0
+)
+
+fit_n2$summary(c("mu", "sigma"))
+```
+
+### Diagnostics
+
+```{r norm2-diag}
+fit_n2$diagnostic_summary()
+
+mcmc_trace(fit_n2$draws(), pars = c("mu", "sigma")) +
+  labs(title = "Trace Plots — Normal Two-Parameter Model")
+
+mcmc_rhat(fit_n2$summary()$rhat) +
+  labs(title = expression(hat(R) ~ "— Normal Two-Parameter Model"))
+```
+
+**Question 2.1:** Are all $\hat{R} < 1.01$? Are there any divergent transitions?
+
+**Question 2.2:** What is the posterior mean and 90% credible interval for $\mu$?
+How does it compare to the sample mean `mean(cd4_6m)`?
+
+### Joint posterior
+
+The MCMC sample lives in 2D $(\mu, \sigma)$ space. Visualise the joint distribution:
+
+```{r norm2-joint}
+mcmc_scatter(fit_n2$draws(), pars = c("mu", "sigma"), alpha = 0.3) +
+  labs(title    = "Joint posterior: mean and SD of CD4 recovery",
+       x = expression(mu ~ "(mean CD4/100)"),
+       y = expression(sigma ~ "(SD CD4/100)"))
+
+mcmc_areas(fit_n2$draws(), pars = c("mu", "sigma"), prob = 0.90) +
+  labs(title = "Marginal posteriors with 90% credible intervals")
+```
+
+**Question 2.3:** Is there a correlation between $\mu$ and $\sigma$ in the joint
+posterior? Why or why not?
+
+### Posterior predictive check
+
+```{r norm2-ppc}
+y_rep_n2 <- fit_n2$draws("y_rep", format = "matrix")
+
+ppc_dens_overlay(cd4_6m, y_rep_n2[1:50, ]) +
+  labs(title    = "PPC: Normal Two-Parameter — CD4/100 at 6 Months",
+       subtitle = "Black = observed; coloured = posterior predictive",
+       x = "CD4 count / 100 (cells/100 \u03bcL)")
+```
+
+**Question 2.4:** Does the posterior predictive distribution cover the observed data
+well? What would a bad PPC look like for this model?
+
+### LOO cross-validation
+
+```{r norm2-loo}
+log_lik_n2 <- fit_n2$draws("log_lik", format = "matrix")
+loo_n2     <- loo(log_lik_n2)
+print(loo_n2)
+```
+
+---
+
+## Part 3: Simple Linear Regression — CD4 Count vs ART Duration
+
+### Clinical question
+
+Does CD4 count (cells/$\mu$L) increase with longer ART duration?
+We have $N = 15$ HIV patients on long-term ART.
+
+- $X$ = years on antiretroviral therapy (`years_art`)
+- $Y$ = CD4 count in cells/100 $\mu$L (multiply $\times 10$ for cells/$\mu$L)
+
+**Model:**
+$$Y_i = a + b\, X_i + \varepsilon_i, \qquad \varepsilon_i \sim \text{Normal}(0, \sigma^2)$$
+
+**Stan model:** `stan/model4-4.stan`
+
+### Load and explore data
+
+```{r cd4-data}
+cd4 <- read.csv("../data/cd4_art_duration.csv")   # columns: years_art, cd4_per100
+
+cat("Patients:", nrow(cd4), "\n")
+summary(cd4)
+```
+
+```{r cd4-explore}
+ggplot(cd4, aes(x = years_art, y = cd4_per100)) +
+  geom_point(size = 2.5, colour = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, colour = "firebrick", linewidth = 0.8) +
+  labs(title    = "CD4 Count vs Years on ART",
+       subtitle = "N = 15 HIV patients on long-term ART",
+       x = "Years on ART",
+       y = "CD4 count (cells / 100 \u03bcL)")
+```
+
+### Compile and fit
+
+```{r cd4-compile}
+mod_cd4 <- cmdstan_model("../stan/model4-4.stan")
+```
+
+```{r cd4-fit}
+fit_cd4 <- mod_cd4$sample(
+  data    = list(N          = nrow(cd4),
+                 years_art  = cd4$years_art,
+                 cd4_per100 = cd4$cd4_per100),
+  seed    = 1234,
+  chains  = 4,
+  refresh = 0
+)
+
+fit_cd4$summary(c("a", "b", "sigma"))
+```
+
+### Diagnostics
+
+```{r cd4-diag}
+fit_cd4$diagnostic_summary()
+
+draws_cd4 <- fit_cd4$draws()
+
+mcmc_trace(draws_cd4, pars = c("a", "b", "sigma")) +
+  labs(title = "Trace Plots — Simple LR: CD4 vs ART Duration")
+
+mcmc_rhat(fit_cd4$summary()$rhat) +
+  labs(title = expression(hat(R) ~ "values (target: all < 1.01)"))
+```
+
+**Question 3.1:** What is the posterior mean and 95% credible interval for $b$
+(CD4 change per additional year on ART)?
+Is there evidence of a positive trend?
+
+**Question 3.2:** Are there any convergence issues?
+Report $\hat{R}$ and ESS for $a$, $b$, $\sigma$.
+
+### Posterior distributions
+
+```{r cd4-posterior}
+draws_cd4_df <- fit_cd4$draws(format = "df")
+
+draws_cd4_df |>
+  select(a, b, sigma) |>
+  pivot_longer(everything(), names_to = "param", values_to = "value") |>
+  ggplot(aes(x = value, fill = param)) +
+  geom_density(alpha = 0.6) +
+  facet_wrap(~param, scales = "free") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  labs(title = "Posterior Distributions: Simple LR (CD4 vs ART Duration)",
+       x = "Value", y = "Density") +
+  theme(legend.position = "none")
+```
+
+### Posterior predictive check
+
+The `generated quantities` block in `model4-4.stan` produces `y_rep` directly.
+
+```{r cd4-ppc}
+y_rep_cd4 <- fit_cd4$draws("y_rep", format = "matrix")
+
+ppc_dens_overlay(cd4$cd4_per100, y_rep_cd4[1:50, ]) +
+  labs(title    = "PPC: Simple LR — CD4 Count",
+       subtitle = "Black = observed; coloured lines = posterior predictive draws",
+       x = "CD4 count (cells / 100 \u03bcL)")
+```
+
+**Question 3.3:** Does the observed CD4 distribution look consistent with the
+posterior predictive distribution?
+
+### LOO cross-validation
+
+```{r cd4-loo}
+log_lik_cd4 <- fit_cd4$draws("log_lik", format = "matrix")
+loo_cd4     <- loo(log_lik_cd4)
+print(loo_cd4)
+plot(loo_cd4, main = "LOO Pareto-k Diagnostics: Simple LR")
+```
+
+**Question 3.4:** Are all Pareto-$k$ values below 0.5? What does this mean for
+the reliability of the LOO estimate?
+
+---
+
+## Part 4: Multiple Linear Regression — ART Adherence
+
+### Clinical question
+
+What patient characteristics predict ART adherence?
+We have $N = 50$ HIV patients.
+
+- $Y$ = ART adherence proportion (0–1, measured over 6 months)
+- Predictors: `sex` (0 = female, 1 = male) and `cd4_init` (CD4 at ART start,
+  cells/100 $\mu$L)
+
+**Model:**
+$$Y_i = b_1 + b_2\,\text{sex}_i + b_3 \times \frac{\text{cd4\_init}_i}{100} + \varepsilon_i,
+\qquad \varepsilon_i \sim \text{Normal}(0,\sigma^2)$$
+
+The CD4 predictor is divided by 100 so the coefficient $b_3$ corresponds to a change
+of 100 cells/100 $\mu$L — matching Matsuura (2022, Chapter 5).
+
+**Stan model:** `stan/model5-3.stan`
+
+### Load and explore data
+
+```{r adh-data}
+adh <- read.csv("../data/hiv_adherence.csv")   # columns: patient_id, sex, cd4_init, adherence_prop
+
+cat("Patients:", nrow(adh), "\n")
+summary(adh)
+```
+
+```{r adh-explore}
+ggplot(adh, aes(x = cd4_init, y = adherence_prop, colour = factor(sex))) +
+  geom_point(size = 2, alpha = 0.75) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+  scale_colour_manual(values  = c("0" = "steelblue", "1" = "tomato"),
+                      labels  = c("0" = "Female", "1" = "Male")) +
+  labs(title    = "ART Adherence vs Baseline CD4 by Sex",
+       subtitle = "N = 50 HIV patients",
+       x = "Baseline CD4 (cells / 100 \u03bcL)",
+       y = "Adherence proportion",
+       colour = "Sex")
+```
+
+### Compile and fit
+
+```{r adh-compile}
+mod_adh <- cmdstan_model("../stan/model5-3.stan")
+```
+
+```{r adh-fit}
+fit_adh <- mod_adh$sample(
+  data = list(
+    N              = nrow(adh),
+    sex            = adh$sex,
+    cd4_init       = adh$cd4_init / 100,   # per 100 cells/100 µL
+    adherence_prop = adh$adherence_prop
+  ),
+  seed    = 1234,
+  chains  = 4,
+  refresh = 0
+)
+
+fit_adh$summary(c("b[1]", "b[2]", "b[3]", "sigma"))
+```
+
+### Diagnostics
+
+```{r adh-diag}
+fit_adh$diagnostic_summary()
+
+mcmc_trace(fit_adh$draws(), pars = c("b[1]", "b[2]", "b[3]", "sigma")) +
+  labs(title = "Trace Plots — Multiple LR: ART Adherence")
+```
+
+**Question 4.1:** What is the direction of $b_2$ (sex effect)?
+Does the 95% credible interval exclude zero?
+How do you interpret this clinically?
+
+**Question 4.2:** Interpret $b_3$.
+What does a one-unit change in `cd4_init/100` correspond to in terms of CD4 cells/$\mu$L?
+(Hint: one unit = 100 cells/100$\mu$L = 1000 cells/$\mu$L. Per 10 cells/100$\mu$L the effect is $b_3/10$.)
+
+### Posterior distributions
+
+```{r adh-posterior}
+draws_adh <- fit_adh$draws(format = "df")
+
+draws_adh |>
+  select(`b[1]`, `b[2]`, `b[3]`) |>
+  rename(Intercept = `b[1]`, Sex_male = `b[2]`, CD4_per100 = `b[3]`) |>
+  pivot_longer(everything(), names_to = "param", values_to = "value") |>
+  ggplot(aes(x = value, fill = param)) +
+  geom_density(alpha = 0.6) +
+  facet_wrap(~param, scales = "free") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  labs(title = "Posterior Distributions: Multiple LR (ART Adherence)",
+       x = "Value", y = "Density") +
+  theme(legend.position = "none")
+```
+
+### Posterior predictive check
+
+The `model5-3.stan` model outputs `y_rep` in `generated quantities`.
+
+```{r adh-ppc}
+y_rep_adh <- fit_adh$draws("y_rep", format = "matrix")
+
+ppc_dens_overlay(adh$adherence_prop, y_rep_adh[1:50, ]) +
+  labs(title    = "PPC: Multiple LR — ART Adherence",
+       subtitle = "Black = observed; coloured = posterior predictive draws",
+       x = "Adherence proportion")
+
+ppc_stat(adh$adherence_prop, y_rep_adh, stat = "mean") +
+  labs(title = "PPC: Mean adherence proportion")
+
+ppc_stat(adh$adherence_prop, y_rep_adh, stat = "sd") +
+  labs(title = "PPC: SD of adherence proportion")
+```
+
+**Question 4.3:** Do the observed summary statistics fall within the posterior
+predictive distributions?
+
+---
+
+## Part 5: Binomial Logistic Regression — Suppression Counts per Patient
+
+### Clinical question
+
+Does the per-visit viral suppression rate vary by sex and baseline CD4 count?
+We have $N = 50$ HIV patients followed for 6 months. For each patient we record
+the number of scheduled clinic visits ($M$) and the number of those visits where
+viral load was suppressed ($Y$).
+
+**Model:**
+$$Y_n \sim \text{Binomial}(M_n,\, q_n), \qquad
+\text{logit}(q_n) = b_1 + b_2\,\text{sex}_n + b_3\,\text{cd4\_init}_n$$
+
+$q_n$ = per-visit suppression probability for patient $n$.
+Note: no $\sigma$ parameter — the Binomial distribution fully specifies the
+variance via $M_n$ and $q_n$.
+
+**Data:** `data/hiv_clinic_counts.csv`
+**Stan model:** `stan/model_binomial_logistic.stan`
+
+### Load and explore data
+
+```{r bin-data}
+d_bin <- read.csv("../data/hiv_clinic_counts.csv")   # columns: patient_id, sex, cd4_init, n_visits, n_supp
+
+cat("Patients:", nrow(d_bin), "\n")
+cat("n_visits range:", range(d_bin$n_visits), "\n")
+cat("n_supp range:", range(d_bin$n_supp), "\n")
+cat("Suppression proportions (n_supp/n_visits):\n")
+summary(d_bin$n_supp / d_bin$n_visits)
+```
+
+```{r bin-explore}
+d_bin |>
+  mutate(prop_supp = n_supp / n_visits,
+         sex_label = ifelse(sex == 1, "Male", "Female")) |>
+  ggplot(aes(x = cd4_init / 100, y = prop_supp, colour = sex_label)) +
+  geom_point(size = 2.5, alpha = 0.75) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 0.8) +
+  scale_colour_manual(values = c("Female" = "steelblue", "Male" = "tomato")) +
+  labs(title    = "Per-Visit Suppression Rate vs Baseline CD4",
+       subtitle = "N = 50 HIV patients; 6-month follow-up",
+       x = "Baseline CD4 (cells / 100 \u03bcL)",
+       y = "Suppression proportion (Y/M)",
+       colour = "Sex")
+```
+
+### Compile and fit
+
+```{r bin-compile}
+mod_bin2 <- cmdstan_model("../stan/model_binomial_logistic.stan")
+```
+
+```{r bin-fit}
+stan_bin2 <- list(N        = nrow(d_bin),
+                  Sex      = d_bin$sex,
+                  cd4_init = d_bin$cd4_init / 100,
+                  n_visits = d_bin$n_visits,
+                  n_supp   = d_bin$n_supp)
+
+fit_bin2 <- mod_bin2$sample(
+  data    = stan_bin2,
+  seed    = 123,
+  chains  = 4,
+  refresh = 0
+)
+
+fit_bin2$summary(c("b[1]", "b[2]", "b[3]"))
+```
+
+### Diagnostics
+
+```{r bin-diag}
+fit_bin2$diagnostic_summary()
+
+mcmc_trace(fit_bin2$draws(), pars = c("b[1]", "b[2]", "b[3]")) +
+  labs(title = "Trace Plots — Binomial Logistic Regression")
+
+mcmc_rhat(fit_bin2$summary()$rhat) +
+  labs(title = expression(hat(R) ~ "— Binomial Logistic Model"))
+```
+
+**Question 5.1:** Are all $\hat{R}$ values below 1.01? Are there any divergent
+transitions?
+
+**Question 5.2:** What is the posterior mean and 90% credible interval for
+$b[3]$ (CD4 effect)? Is there strong evidence that higher baseline CD4 increases
+the per-visit suppression probability?
+
+### Posterior distributions
+
+```{r bin-posterior}
+fit_bin2$draws(format = "df") |>
+  select(`b[1]`, `b[2]`, `b[3]`) |>
+  rename(Intercept = `b[1]`, Sex_male = `b[2]`, CD4_init = `b[3]`) |>
+  pivot_longer(everything(), names_to = "param", values_to = "value") |>
+  ggplot(aes(x = value, fill = param)) +
+  geom_density(alpha = 0.6) +
+  facet_wrap(~param, scales = "free") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  labs(title = "Posterior Distributions: Binomial Logistic Regression",
+       x = "Value (logit scale)", y = "Density") +
+  theme(legend.position = "none")
+```
+
+### Posterior predictive check
+
+For Binomial outcomes, compare the observed **suppression proportions** ($Y/M$)
+against the posterior predictive proportions.
+
+```{r bin-ppc}
+yp_bin2    <- fit_bin2$draws("yp", format = "matrix")
+prop_obs   <- d_bin$n_supp / d_bin$n_visits
+prop_rep   <- t(apply(yp_bin2, 1, function(r) r / d_bin$n_visits))
+
+ppc_dens_overlay(prop_obs, prop_rep[1:50, ]) +
+  labs(title    = "PPC: Binomial Logistic -- Suppression Rate per Patient",
+       subtitle = "Black = observed; coloured = posterior predictive draws",
+       x = "Suppression proportion (n_supp/n_visits)")
+
+ppc_stat(prop_obs, prop_rep, stat = "mean") +
+  labs(title = "PPC: Mean suppression rate")
+```
+
+**Question 5.3:** Does the observed distribution of suppression proportions
+fall within the posterior predictive distribution? Is the mean well-reproduced?
+
+### LOO cross-validation
+
+```{r bin-loo}
+log_lik_bin2 <- fit_bin2$draws("log_lik", format = "matrix")
+loo_bin2     <- loo(log_lik_bin2)
+print(loo_bin2)
+plot(loo_bin2, main = "LOO Pareto-k: Binomial Logistic Model")
+```
+
+**Question 5.4:** Are all Pareto-$k$ values below 0.5? Which patients (if any)
+are influential observations?
+
+---
+
+## Part 6: Logistic Regression — Per-Visit Binary Suppression
+
+### Clinical question
+
+Does receiving adherence counselling at a clinic visit increase the probability
+of viral suppression at that visit? We have visit-level data from HIV patients
+(multiple rows per patient).
+
+- `suppressed` ($Y$): viral suppression at that visit (1 = VL $< 1000$, 0 = not)
+- `sex`: patient sex (0 = female, 1 = male)
+- `cd4_init`: CD4 at ART start (cells/100 $\mu$L)
+- `counselling`: received adherence counselling at that visit (0/1)
+
+**Model:**
+$$\text{suppressed}[v] \sim \text{Bernoulli}(q[v]), \qquad
+q[v] = \text{logit}^{-1}(b_1 + b_2\,\text{sex} + b_3\,\text{cd4\_init} + b_4\,\text{counselling}[v])$$
+
+**Data:** `data/hiv_visit_level.csv`
+**Stan model:** `stan/model_logistic.stan`
+
+### Load and explore data
+
+```{r log5-data}
+d_log <- read.csv("../data/hiv_visit_level.csv")   # columns: patient_id, sex, cd4_init, counselling, suppressed
+
+cat("Visit records:", nrow(d_log), "\n")
+cat("Suppression rate overall:", round(mean(d_log$suppressed), 3), "\n")
+cat("Suppression by counselling:\n")
+print(tapply(d_log$suppressed, d_log$counselling, mean))
+```
+
+```{r log5-explore}
+d_log |>
+  mutate(counselling_label = ifelse(counselling == 1,
+                                    "Counselling", "No counselling")) |>
+  ggplot(aes(x = cd4_init / 100, y = suppressed,
+             colour = counselling_label)) +
+  geom_jitter(width = 0, height = 0.04, alpha = 0.6, size = 2) +
+  geom_smooth(method = "glm", method.args = list(family = binomial),
+              se = FALSE, linewidth = 0.9) +
+  scale_colour_manual(values = c("No counselling" = "steelblue",
+                                 "Counselling"    = "firebrick")) +
+  labs(title    = "Per-Visit Suppression vs CD4 by Counselling",
+       subtitle = "Visit-level data; multiple rows per patient",
+       x = "Baseline CD4 (cells / 100 \u03bcL)",
+       y = "Viral suppression (1 = suppressed)",
+       colour = "Counselling")
+```
+
+### Compile and fit
+
+```{r log5-compile}
+mod_log5 <- cmdstan_model("../stan/model_logistic.stan")
+```
+
+```{r log5-fit}
+stan_log5 <- list(V           = nrow(d_log),
+                  Sex         = d_log$sex,
+                  cd4_init    = d_log$cd4_init / 100,
+                  counselling = d_log$counselling,
+                  suppressed  = d_log$suppressed)
+
+fit_log5 <- mod_log5$sample(
+  data    = stan_log5,
+  seed    = 123,
+  chains  = 4,
+  refresh = 0
+)
+
+fit_log5$summary(c("b[1]", "b[2]", "b[3]", "b[4]"))
+```
+
+### Diagnostics
+
+```{r log5-diag}
+fit_log5$diagnostic_summary()
+
+mcmc_trace(fit_log5$draws(), pars = c("b[1]", "b[2]", "b[3]", "b[4]")) +
+  labs(title = "Trace Plots — Logistic Regression: Per-Visit Suppression")
+
+mcmc_rhat(fit_log5$summary()$rhat) +
+  labs(title = expression(hat(R) ~ "— Logistic Model"))
+```
+
+**Question 6.1:** Summarise convergence: are all $\hat{R} < 1.01$ and ESS $> 400$?
+
+**Question 6.2:** What is the posterior mean and 90% credible interval for $b[4]$
+(counselling effect)? Exponentiate to get the odds ratio. Is there strong evidence
+that counselling increases suppression odds?
+
+### Posterior distributions
+
+```{r log5-posterior}
+fit_log5$draws(format = "df") |>
+  select(`b[1]`, `b[2]`, `b[3]`, `b[4]`) |>
+  rename(Intercept  = `b[1]`,
+         Sex_male   = `b[2]`,
+         CD4_init   = `b[3]`,
+         Counselling = `b[4]`) |>
+  pivot_longer(everything(), names_to = "param", values_to = "value") |>
+  ggplot(aes(x = value, fill = param)) +
+  geom_density(alpha = 0.6) +
+  facet_wrap(~param, scales = "free") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  labs(title = "Posterior Distributions: Logistic Regression",
+       x = "Value (logit scale)", y = "Density") +
+  theme(legend.position = "none")
+```
+
+### Posterior predictive check
+
+For binary outcomes, compare the observed and replicated suppression proportions
+within each counselling group.
+
+```{r log5-ppc-grouped}
+yp_log5 <- fit_log5$draws("yp", format = "matrix")
+
+ppc_stat_grouped(d_log$suppressed, yp_log5,
+  group = factor(d_log$counselling,
+                 labels = c("No counselling", "Counselling")),
+  stat  = "mean") +
+  labs(title    = "PPC: Suppression Rate by Counselling Status",
+       subtitle = "Posterior predictive distribution vs observed proportion")
+```
+
+```{r log5-ppc-overall}
+ppc_stat(d_log$suppressed, yp_log5, stat = "mean") +
+  labs(title = "PPC: Overall mean per-visit suppression rate")
+```
+
+**Question 6.3:** Does the model reproduce the observed suppression rate in
+each counselling group? If not, what might be missing from the model?
+
+**Question 6.4:** Repeated visits from the same patient are treated as
+independent here. What is the key limitation of this assumption? Which model
+extension (covered in Session 1) would address it?
+
+### LOO cross-validation
+
+```{r log5-loo}
+log_lik_log5 <- fit_log5$draws("log_lik", format = "matrix")
+loo_log5     <- loo(log_lik_log5)
+print(loo_log5)
+plot(loo_log5, main = "LOO Pareto-k: Logistic Model")
+```
+
+---
+
+## Part 7: Poisson Regression — Clinic Visit Counts
+
+### Clinical question
+
+Do patients with higher baseline CD4 attend more or fewer clinic visits?
+We use the **same dataset** as Part 5 (`hiv_clinic_counts.csv`), but now the
+count of visits ($M$) is the **outcome**, not the denominator.
+
+**Model:**
+$$\texttt{n\_visits}_n \sim \text{Poisson}(\lambda_n), \qquad
+\log(\lambda_n) = b_1 + b_2\,\text{sex}_n + b_3\,\text{cd4\_init}_n$$
+
+**Data:** `data/hiv_clinic_counts.csv` (same as Part 5; $M$ is now the response)
+**Stan model:** `stan/model_poisson.stan`
+
+### Load and explore data
+
+```{r pois6-data}
+d_pois <- read.csv("../data/hiv_clinic_counts.csv")   # columns: patient_id, sex, cd4_init, n_visits, n_supp
+
+cat("Patients:", nrow(d_pois), "\n")
+cat("Visit count summary:\n")
+summary(d_pois$n_visits)
+cat("Mean:", round(mean(d_pois$n_visits), 2),
+    " Var:", round(var(d_pois$n_visits), 2),
+    " (Poisson expects Var ~ Mean)\n")
+```
+
+```{r pois6-explore}
+d_pois |>
+  mutate(sex_label = ifelse(sex == 1, "Male", "Female")) |>
+  ggplot(aes(x = cd4_init / 100, y = n_visits, colour = sex_label)) +
+  geom_point(size = 2.5, alpha = 0.75) +
+  geom_smooth(method = "glm",
+              method.args = list(family = poisson),
+              se = FALSE, linewidth = 0.8) +
+  scale_colour_manual(values = c("Female" = "steelblue", "Male" = "tomato")) +
+  labs(title    = "Clinic Visit Count vs Baseline CD4",
+       subtitle = "N = 50 HIV patients; 6-month follow-up",
+       x = "Baseline CD4 (cells / 100 \u03bcL)",
+       y = "Number of clinic visits",
+       colour = "Sex")
+```
+
+### Compile and fit
+
+```{r pois6-compile}
+mod_pois6 <- cmdstan_model("../stan/model_poisson.stan")
+```
+
+```{r pois6-fit}
+stan_pois6 <- list(N        = nrow(d_pois),
+                   Sex      = d_pois$sex,
+                   cd4_init = d_pois$cd4_init / 100,
+                   n_visits = d_pois$n_visits)
+
+fit_pois6 <- mod_pois6$sample(
+  data    = stan_pois6,
+  seed    = 123,
+  chains  = 4,
+  refresh = 0
+)
+
+fit_pois6$summary(c("b[1]", "b[2]", "b[3]"))
+```
+
+### Diagnostics
+
+```{r pois6-diag}
+fit_pois6$diagnostic_summary()
+
+mcmc_trace(fit_pois6$draws(), pars = c("b[1]", "b[2]", "b[3]")) +
+  labs(title = "Trace Plots — Poisson Regression: Clinic Visit Counts")
+
+mcmc_rhat(fit_pois6$summary()$rhat) +
+  labs(title = expression(hat(R) ~ "— Poisson Model"))
+```
+
+**Question 7.1:** What is the posterior mean and 90% credible interval for
+$b[3]$ (CD4 effect on visit count)? Exponentiate for the visit-rate ratio. Does
+the CI exclude 1?
+
+**Question 7.2:** What is the posterior mean for $b[1]$? Compute $e^{b[1]}$ —
+what does this represent clinically?
+
+### Posterior distributions
+
+```{r pois6-posterior}
+fit_pois6$draws(format = "df") |>
+  select(`b[1]`, `b[2]`, `b[3]`) |>
+  rename(Intercept = `b[1]`, Sex_male = `b[2]`, CD4_init = `b[3]`) |>
+  pivot_longer(everything(), names_to = "param", values_to = "value") |>
+  ggplot(aes(x = value, fill = param)) +
+  geom_density(alpha = 0.6) +
+  facet_wrap(~param, scales = "free") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey40") +
+  labs(title = "Posterior Distributions: Poisson Regression",
+       x = "Value (log scale)", y = "Density") +
+  theme(legend.position = "none")
+```
+
+### Posterior predictive check (rootogram)
+
+For count data, a **rootogram** is more informative than a density overlay:
+it shows the square-root of observed vs predicted frequencies at each integer value.
+
+```{r pois6-ppc}
+mp_pois6 <- fit_pois6$draws("mp", format = "matrix")
+
+ppc_rootogram(d_pois$n_visits, mp_pois6, style = "hanging") +
+  labs(title    = "PPC Rootogram: Poisson -- Clinic Visit Counts",
+       subtitle = "Bars drop from predicted line; deviation from zero = misfit",
+       x = "Number of visits",
+       y = expression(sqrt(frequency)))
+
+ppc_stat(d_pois$n_visits, mp_pois6, stat = "var") +
+  labs(title    = "PPC: Variance of visit counts",
+       subtitle = "If obs variance >> predicted -> consider negative-binomial")
+```
+
+**Question 7.3:** Does the rootogram show good agreement between observed and
+predicted visit-count frequencies?
+
+**Question 7.4:** Compare the observed variance to the predicted variance from
+the PPC. If the observed variance is substantially larger than the posterior
+predictive variance, what does this suggest about model fit, and what
+alternative model would you try?
+
+### LOO cross-validation
+
+```{r pois6-loo}
+log_lik_pois6 <- fit_pois6$draws("log_lik", format = "matrix")
+loo_pois6     <- loo(log_lik_pois6)
+print(loo_pois6)
+plot(loo_pois6, main = "LOO Pareto-k: Poisson Model")
+```
+
+---
+
+## Summary
+
+| Model | Outcome type | Stan likelihood | Key output | $N$ |
+|-------|-------------|-----------------|-----------|-----|
+| 1. Binomial | Binary (aggregate) | `binomial()` | $P(\theta > 0.5)$ | 30 |
+| 2. Normal (2 params) | Continuous | `normal()` | $\mu$, $\sigma$; joint posterior | 20 |
+| 3. Simple LR | Continuous | `normal()` | Slope $b$; PPC | 15 |
+| 4. Multiple LR | Continuous | `normal()` | $b_2$ (sex), $b_3$ (CD4) | 50 |
+| 5. Binomial Logistic | Count of successes | `binomial()` | Suppression rate; PPC on Y/M | 50 |
+| 6. Logistic | Binary (per visit) | `bernoulli()` | Counselling OR; grouped PPC | V visits |
+| 7. Poisson | Count | `poisson_log()` | Visit-rate ratio; rootogram | 50 |
+
+**Convergence checklist (all models):**
+
+- [ ] $\hat{R} < 1.01$ for all parameters
+- [ ] ESS$_{\text{bulk}} > 400$ and ESS$_{\text{tail}} > 400$
+- [ ] Zero divergent transitions
+- [ ] E-BFMI $> 0.2$
+- [ ] PPC looks reasonable for each outcome type
+
+---
+
+## Session 1 Preview
+
+In the next session we extend to **repeated measurements** from the same patient —
+introducing the Linear Mixed Effects model:
+
+$$y_{ij} = (\beta_0 + u_{0i}) + (\beta_1 + u_{1i})\, t_{ij} + \varepsilon_{ij}$$
+
+where $u_{0i}$ and $u_{1i}$ capture patient-specific deviations in baseline level
+and rate of change. We will fit three progressively richer Stan models using
+PBC bilirubin data, following Sorensen et al.\ (2016).
