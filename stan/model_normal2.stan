@@ -1,6 +1,5 @@
 // model_normal2.stan
-// Matsuura (2022), Chapter 3, Section 3.5.2 extended to two unknowns
-//
+/
 // Medical application: N HIV patients; CD4 count (cells/100 uL) at 6 months post-ART
 //   cd4_6m[n] = CD4 count / 100 for patient n
 //

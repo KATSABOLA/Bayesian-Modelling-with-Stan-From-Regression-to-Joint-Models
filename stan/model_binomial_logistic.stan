@@ -1,5 +1,4 @@
 // model_binomial_logistic.stan
-// Matsuura (2022), Chapter 5, Section 5.3 — Binomial Logistic Regression
 //
 // Medical application: N = 50 HIV patients followed for 6 months
 //   Sex       = patient sex (0 = female, 1 = male)

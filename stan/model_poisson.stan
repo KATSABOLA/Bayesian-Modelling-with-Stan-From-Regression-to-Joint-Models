@@ -1,6 +1,4 @@
 // model_poisson.stan
-// Matsuura (2022), Chapter 5, Section 5.5 — Poisson Regression (log link)
-//
 // Medical application: N = 50 HIV patients followed for 6 months
 //   Sex       = patient sex (0 = female, 1 = male)
 //   cd4_init  = CD4 count at ART initiation (cells/100 uL), pass as cd4_init/100

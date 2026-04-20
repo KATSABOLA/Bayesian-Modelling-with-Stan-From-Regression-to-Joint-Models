@@ -1,5 +1,4 @@
 // model4-4.stan
-// Matsuura (2022), Bayesian Statistical Modeling with Stan, R, and Python
 // Chapter 4: Simple linear regression
 //
 // Medical application: N = 15 HIV patients on long-term ART

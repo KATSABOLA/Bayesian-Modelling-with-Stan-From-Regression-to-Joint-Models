@@ -1,5 +1,3 @@
-// model_logistic.stan
-// Matsuura (2022), Chapter 5, Section 5.4 — Logistic Regression
 //
 // Medical application: V visit-level observations across HIV patients
 //   Sex         = patient sex (0 = female, 1 = male)

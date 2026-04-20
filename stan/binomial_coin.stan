@@ -1,8 +1,3 @@
-// binomial_coin.stan
-// Matsuura (2022), Bayesian Statistical Modeling with Stan, R, and Python
-// Chapter 4: Binomial model
-// Medical application: N HIV patients; n_suppressed = number with viral suppression
-
 data {
   int<lower=0> N;              // number of patients tested
   int<lower=0> n_suppressed;   // number with viral suppression
