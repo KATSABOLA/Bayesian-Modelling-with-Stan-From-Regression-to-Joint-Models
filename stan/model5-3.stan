@@ -1,6 +1,4 @@
 // model5-3.stan
-// Matsuura (2022), Bayesian Statistical Modeling with Stan, R, and Python
-// Chapter 5: Multiple regression
 // N = 50 HIV patients; sex (0=female,1=male); cd4_init (CD4/100 at ART initiation);
 // adherence_prop = ART adherence proportion (0-1)
 
