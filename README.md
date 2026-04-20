@@ -4,9 +4,6 @@ A 4-session hands-on short course in applied Bayesian modelling using Stan and c
 Covers regression, longitudinal mixed-effects models, survival models, and joint models
 with clinical applications to HIV/TB data. Practicals in Quarto (R).
 
-**Institution:** Division of Epidemiology & Biostatistics, Stellenbosch University  
-**Year:** 2026
-
 ---
 
 ## Course Overview
