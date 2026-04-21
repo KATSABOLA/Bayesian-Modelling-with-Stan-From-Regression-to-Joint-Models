@@ -33,3 +33,12 @@ generated quantities {
   for (n in 1:N)
     log_lik[n] = normal_lpdf(adherence_prop[n] | mu[n], sigma);
 }
+
+
+
+
+
+
+
+
+
