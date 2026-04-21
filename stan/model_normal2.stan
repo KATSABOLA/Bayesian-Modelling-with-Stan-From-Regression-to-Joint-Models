@@ -1,5 +1,5 @@
 // model_normal2.stan
-/
+//
 // Medical application: N HIV patients; CD4 count (cells/100 uL) at 6 months post-ART
 //   cd4_6m[n] = CD4 count / 100 for patient n
 //
