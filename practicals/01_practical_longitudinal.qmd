@@ -1,0 +1,963 @@
+---
+title: "Session 1 Practical: Bayesian Longitudinal Modelling"
+subtitle: "From Fixed Effects to Varying Slopes — Three Models for log(Serum Bilirubin)"
+author: "JM Training 2026"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-float: true
+    code-fold: false
+    code-tools: true
+    theme: flatly
+    highlight-style: github
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  cache: false
+---
+
+## Overview
+
+In this practical you will build three nested Bayesian models for the PBC
+longitudinal data, following the approach in Sorensen, Hohenstein & Kliegl
+(2016, *Frontiers in Psychology*), applied here to clinical biomarker data:
+
+| Model | Description | Stan file |
+|-------|-------------|-----------|
+| **M1** | Fixed effects only — naive linear regression | `lme_m1_fixed.stan` |
+| **M2** | Varying intercepts — patient-specific baseline bilirubin | `lme_m2_intercepts.stan` |
+| **M3** | Varying intercepts **and** slopes — full LME *(primary model)* | `lme_m3_full.stan` |
+
+**Learning objectives:**
+
+1. Understand why naive regression violates independence for longitudinal data
+2. Implement non-centred parameterisations for hierarchical models in Stan
+3. Interpret variance components and the intraclass correlation coefficient (ICC)
+4. Use the LKJ prior on the correlation matrix of random effects
+5. Compare models with LOO cross-validation and posterior predictive checks
+6. Appreciate shrinkage as a feature, not a flaw
+
+---
+
+## Setup
+
+```{r setup}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(loo)
+library(tidyverse)
+library(survival)
+library(patchwork)
+
+color_scheme_set("teal")
+
+# Set a consistent ggplot2 theme
+theme_set(theme_minimal(base_size = 12))
+```
+
+---
+
+## 1. Data Preparation
+
+```{r data-prep}
+source("../R/data_prep.R")
+
+# data_prep.R creates:
+#   long_data   — tibble with log_bili, time_yrs, subj_idx, and raw variables
+#   stan_lme_m1 / stan_lme_m2 / stan_lme_m3  — Stan data lists (all identical)
+
+cat("Longitudinal data summary\n")
+cat("  Patients:             ", n_subj, "\n")
+cat("  Total observations:   ", stan_lme_m3$N, "\n")
+cat("  Mean visits/patient:  ",
+    round(stan_lme_m3$N / stan_lme_m3$n_subj, 1), "\n")
+cat("  Follow-up range (yr): ",
+    round(range(long_data$time_yrs), 2), "\n")
+```
+
+### 1.1 Descriptive Statistics
+
+```{r descriptives}
+long_data |>
+  summarise(
+    n_obs       = n(),
+    mean_bili   = round(mean(bili), 2),
+    median_bili = round(median(bili), 2),
+    sd_bili     = round(sd(bili), 2),
+    mean_logbili = round(mean(log_bili), 3),
+    sd_logbili   = round(sd(log_bili), 3),
+    min_t       = round(min(time_yrs), 2),
+    max_t       = round(max(time_yrs), 2)
+  ) |>
+  knitr::kable(caption = "Summary statistics: PBC longitudinal data")
+```
+
+```{r visits-per-patient}
+visits_per_patient <- long_data |>
+  count(subj_idx, name = "n_visits")
+
+ggplot(visits_per_patient, aes(x = n_visits)) +
+  geom_histogram(bins = 20, fill = "steelblue", colour = "white") +
+  labs(title = "Distribution of Visit Counts per Patient",
+       x = "Number of visits", y = "Number of patients")
+```
+
+### 1.2 Serum Bilirubin Distribution
+
+```{r bili-dist}
+p1 <- ggplot(long_data, aes(x = bili)) +
+  geom_histogram(bins = 40, fill = "steelblue", colour = "white") +
+  labs(title = "Raw serum bilirubin (mg/dL)",
+       x = "Serum bilirubin", y = "Count")
+
+p2 <- ggplot(long_data, aes(x = log_bili)) +
+  geom_histogram(bins = 40, fill = "darkgreen", colour = "white") +
+  labs(title = "log(serum bilirubin)",
+       x = "log(bilirubin)", y = "Count")
+
+p1 + p2 +
+  plot_annotation(title = "Bilirubin: raw vs log scale",
+                  subtitle = "Log transformation reduces skewness — we model log(bilirubin)")
+```
+
+**Question 1.1:** Why is modelling on the log scale preferable here?
+
+### 1.3 Individual Patient Trajectories
+
+```{r traj-plot}
+set.seed(42)
+sample_ids <- sample(unique(long_data$subj_idx), 40)
+
+long_data |>
+  filter(subj_idx %in% sample_ids) |>
+  ggplot(aes(x = time_yrs, y = log_bili, group = subj_idx)) +
+  geom_line(alpha = 0.3, colour = "steelblue") +
+  geom_smooth(aes(group = 1), method = "loess", se = FALSE,
+              colour = "darkred", linewidth = 1.5) +
+  labs(title = "PBC: Individual log(Bilirubin) Trajectories — 40 Patients",
+       subtitle = "Dark red = loess population trend",
+       x = "Time since enrolment (years)", y = "log(Serum Bilirubin)")
+```
+
+**Question 1.2:** Does the population trend appear linear over time?
+
+**Question 1.3:** Is there substantial between-patient variation at baseline
+(at time = 0)? What does this suggest about the need for random intercepts?
+
+**Question 1.4:** Do some patients show clearly different *slopes* compared to others?
+What does this suggest about random slopes?
+
+---
+
+## 2. Model 1: Fixed Effects Only (Naive Linear Regression)
+
+### 2.1 Mathematical Model
+
+$$Y_{ij} = \beta_0 + \beta_1 \, t_{ij} + \varepsilon_{ij}, \qquad \varepsilon_{ij} \overset{\text{iid}}{\sim} \mathcal{N}(0,\sigma^2)$$
+
+**Priors:**
+
+$$\beta_0 \sim \mathcal{N}(0,\, 5^2), \qquad \beta_1 \sim \mathcal{N}(0,\, 2^2), \qquad \sigma \sim t_4^+(0,\, 1)$$
+
+**Assumption (that we know is wrong):** all 1,945 observations are independent —
+even repeated measurements from the same patient.
+
+### 2.2 Compile and Fit
+
+```{r m1-fit}
+mod_m1 <- cmdstan_model("../stan/lme_m1_fixed.stan")
+
+fit_m1 <- mod_m1$sample(
+  data            = stan_lme_m1,   # N, y, t  (no subj_id in M1)
+  seed            = 123,
+  chains          = 4,
+  parallel_chains = 4,
+  iter_warmup     = 1000,
+  iter_sampling   = 1000,
+  refresh         = 500
+)
+```
+
+### 2.3 Convergence Diagnostics
+
+```{r m1-diag}
+fit_m1$diagnostic_summary()
+```
+
+```{r m1-summary}
+fit_m1$summary(c("beta0", "beta1", "sigma")) |>
+  select(variable, mean, sd, q5, q95, rhat, ess_bulk) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  knitr::kable(caption = "Model 1: Posterior Summary")
+```
+
+```{r m1-trace}
+mcmc_trace(
+  fit_m1$draws(c("beta0", "beta1", "sigma")),
+  facet_args = list(ncol = 1)
+) +
+  labs(title = "Model 1: Trace Plots")
+```
+
+### 2.4 Posterior Predictive Check
+
+```{r m1-ppc}
+y_rep_m1 <- fit_m1$draws("y_rep", format = "matrix")
+
+ppc_dens_overlay(stan_lme_m1$y, y_rep_m1[1:50, ]) +
+  labs(title = "Model 1 PPC: Density Overlay",
+       subtitle = "Dark line = observed; light lines = posterior predictive replications")
+```
+
+```{r m1-ppc-stats}
+ppc_stat(stan_lme_m1$y, y_rep_m1, stat = "mean") +
+  labs(title = "M1 PPC: Mean check")
+
+ppc_stat(stan_lme_m1$y, y_rep_m1, stat = "sd") +
+  labs(title = "M1 PPC: SD check")
+```
+
+**Question 2.1:** Does Model 1 appear to reproduce the marginal distribution
+of log(bilirubin)? Does this mean the model is correct?
+
+### 2.5 Residual Autocorrelation — Why M1 Fails
+
+```{r m1-resid-autocorr}
+# Compute posterior mean fitted values
+mu_m1 <- fit_m1$draws("mu", format = "matrix") |> colMeans()
+
+resid_m1_df <- long_data |>
+  mutate(resid_m1 = log_bili - mu_m1) |>
+  group_by(subj_idx) |>
+  arrange(time_yrs, .by_group = TRUE) |>
+  mutate(visit_num = row_number())
+
+# Plot within-patient residuals for 6 patients
+resid_m1_df |>
+  filter(subj_idx %in% 1:6) |>
+  ggplot(aes(x = visit_num, y = resid_m1)) +
+  geom_line(colour = "steelblue") +
+  geom_point(colour = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "darkred") +
+  facet_wrap(~subj_idx, labeller = label_both) +
+  labs(title = "Model 1: Within-patient residuals",
+       subtitle = "Systematic trends → independence assumption violated",
+       x = "Visit number", y = "Residual (observed − fitted)")
+```
+
+```{r m1-autocorr-lag1}
+# Compute lag-1 autocorrelation of residuals within patients
+autocorr_df <- resid_m1_df |>
+  group_by(subj_idx) |>
+  filter(n() >= 3) |>   # need at least 3 visits for lag-1 autocorr
+  summarise(
+    ac1 = cor(resid_m1[-n()], resid_m1[-1], use = "complete.obs")
+  )
+
+ggplot(autocorr_df, aes(x = ac1)) +
+  geom_histogram(bins = 30, fill = "tomato", colour = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Model 1: Lag-1 Autocorrelation of Within-Patient Residuals",
+       subtitle = "Positive autocorrelation → independence violated → SEs too small",
+       x = "Lag-1 autocorrelation", y = "Number of patients")
+
+cat("Median lag-1 autocorrelation:", round(median(autocorr_df$ac1, na.rm = TRUE), 3), "\n")
+```
+
+**Question 2.2:** Is the median within-patient autocorrelation close to zero?
+What does a positive autocorrelation imply for the credible intervals of $\beta_1$?
+
+### 2.6 Comparison with Rizopoulos / `lm()`
+
+```{r m1-rizopoulos}
+library(lme4)
+
+# Frequentist naive regression (same wrong independence assumption as M1)
+lm_m1 <- lm(log_bili ~ time_yrs, data = long_data)
+
+cat("=== lm() estimates (Rizopoulos-style naive regression) ===\n")
+coef(summary(lm_m1))
+
+cat("\n=== Side-by-side comparison: lm() vs Stan M1 ===\n")
+stan_m1_summ <- fit_m1$summary(c("beta0", "beta1", "sigma")) |>
+  select(variable, mean, sd, q5, q95)
+
+comparison_m1 <- tibble(
+  Parameter = c("β₀ (intercept)", "β₁ (slope/yr)", "σ (residual SD)"),
+  `lm() estimate` = round(c(coef(lm_m1)["(Intercept)"],
+                              coef(lm_m1)["time_yrs"],
+                              sigma(lm_m1)), 3),
+  `Stan M1 median` = round(stan_m1_summ$mean, 3),
+  `Stan 90% CI`    = paste0("[", round(stan_m1_summ$q5, 3), ", ",
+                                 round(stan_m1_summ$q95, 3), "]")
+)
+knitr::kable(comparison_m1, caption = "Model 1: lm() vs Stan — both ignore clustering")
+```
+
+**Question 2.3:** Do the `lm()` and Stan M1 estimates agree? What does this
+confirm about the Stan implementation? Why are both still *wrong* despite their agreement?
+
+---
+
+## 3. Model 2: Varying Intercepts (Random Intercept Model)
+
+### 3.1 Mathematical Model
+
+$$Y_{ij} = (\beta_0 + u_{0i}) + \beta_1 \, t_{ij} + \varepsilon_{ij}$$
+
+**Random effects and priors:**
+
+$$u_{0i} \overset{\text{iid}}{\sim} \mathcal{N}(0,\, \sigma_u^2), \qquad \sigma_u \sim t_4^+(0,\, 1)$$
+
+**Non-centred (Stan) form:** $u_{0i}^* \sim \mathcal{N}(0,1)$, $u_{0i} = \sigma_u \cdot u_{0i}^*$
+
+**Intraclass Correlation Coefficient:**
+
+$$\text{ICC} = \frac{\sigma_u^2}{\sigma_u^2 + \sigma^2}$$
+
+Fraction of total log-bilirubin variance attributable to stable between-patient differences.
+
+### 3.2 Compile and Fit
+
+```{r m2-fit}
+mod_m2 <- cmdstan_model("../stan/lme_m2_intercepts.stan")
+
+fit_m2 <- mod_m2$sample(
+  data            = stan_lme_m2,
+  seed            = 123,
+  chains          = 4,
+  parallel_chains = 4,
+  iter_warmup     = 1000,
+  iter_sampling   = 1000,
+  refresh         = 500
+)
+```
+
+### 3.3 Convergence Diagnostics
+
+```{r m2-diag}
+fit_m2$diagnostic_summary()
+```
+
+```{r m2-summary}
+fit_m2$summary(c("beta0", "beta1", "sigma_u", "sigma")) |>
+  select(variable, mean, sd, q5, q95, rhat, ess_bulk) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  knitr::kable(caption = "Model 2: Posterior Summary — Population-Level Parameters")
+```
+
+```{r m2-trace}
+mcmc_trace(
+  fit_m2$draws(c("beta0", "beta1", "sigma_u", "sigma")),
+  facet_args = list(ncol = 2)
+) +
+  labs(title = "Model 2: Trace Plots")
+```
+
+### 3.4 Posterior Distributions
+
+```{r m2-intervals}
+mcmc_areas(
+  fit_m2$draws(c("beta0", "beta1", "sigma_u", "sigma")),
+  prob = 0.90
+) +
+  labs(title = "Model 2: 90% Credible Intervals")
+```
+
+**Question 3.1:** Is $\hat{\sigma}_u$ larger or smaller than $\hat{\sigma}$?
+What does this mean about the sources of variability in log(bilirubin)?
+
+### 3.5 Intraclass Correlation Coefficient (ICC)
+
+```{r m2-icc}
+draws_m2 <- fit_m2$draws(format = "df")
+
+icc_draws <- draws_m2 |>
+  mutate(ICC = sigma_u^2 / (sigma_u^2 + sigma^2))
+
+# Posterior summary of ICC
+cat("Posterior ICC (fraction of variance between patients):\n")
+quantile(icc_draws$ICC, c(0.025, 0.25, 0.5, 0.75, 0.975)) |>
+  round(3) |>
+  print()
+
+# Visualise
+ggplot(icc_draws, aes(x = ICC)) +
+  geom_histogram(bins = 40, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = median(icc_draws$ICC),
+             colour = "darkred", linewidth = 1) +
+  labs(title = "Model 2: Posterior Distribution of ICC",
+       subtitle = "ICC = σ²_u / (σ²_u + σ²)",
+       x = "Intraclass Correlation Coefficient", y = "Posterior draws")
+```
+
+**Question 3.2:** Interpret the posterior median ICC in clinical terms.
+Does this justify the use of random effects?
+
+### 3.6 Distribution of Random Intercepts
+
+```{r m2-ranef-dist}
+# Posterior mean random intercept for each patient
+u_draws_m2 <- fit_m2$draws("u", format = "matrix")
+u0_means_m2 <- colMeans(u_draws_m2)
+
+tibble(u0i = u0_means_m2) |>
+  ggplot(aes(x = u0i)) +
+  geom_histogram(bins = 30, fill = "steelblue", colour = "white", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "darkred") +
+  labs(title = "Model 2: Posterior Mean Random Intercepts — All 312 Patients",
+       subtitle = "Does the distribution look approximately normal?",
+       x = expression(hat(u)["0i"]), y = "Count")
+```
+
+**Question 3.3:** Do the estimated random intercepts appear approximately
+normally distributed? Does any patient stand out as an outlier?
+
+### 3.7 Shrinkage Illustration
+
+```{r m2-shrinkage}
+# Raw per-patient means (no pooling)
+raw_means_df <- long_data |>
+  group_by(subj_idx) |>
+  summarise(
+    raw_mean = mean(log_bili),
+    n_visits = n()
+  )
+
+beta0_hat_m2 <- mean(fit_m2$draws("beta0", format = "matrix"))
+
+shrink_df <- tibble(
+  subj_idx    = 1:n_subj,
+  raw_mean    = raw_means_df$raw_mean,
+  pooled_mean = beta0_hat_m2 + u0_means_m2,
+  n_visits    = raw_means_df$n_visits
+)
+
+ggplot(shrink_df, aes(x = raw_mean, y = pooled_mean, colour = n_visits)) +
+  geom_point(alpha = 0.8, size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_colour_viridis_c(name = "No. visits") +
+  labs(
+    title = "Shrinkage: Raw Patient Means vs Model 2 Partial-Pooling Estimates",
+    subtitle = "Points below the diagonal are shrunk toward the population mean.\nPatients with fewer visits (darker) show more shrinkage.",
+    x = "Raw patient mean of log(bilirubin)",
+    y = "Model 2 estimate of patient intercept + β₀"
+  )
+```
+
+**Question 3.4:** Which patients are shrunk the most? Why?
+Is this a problem or a desirable property?
+
+### 3.8 Within-Patient Residuals After M2
+
+```{r m2-resid-check}
+mu_m2 <- fit_m2$draws("mu", format = "matrix") |> colMeans()
+
+long_data |>
+  mutate(resid_m2 = log_bili - mu_m2) |>
+  group_by(subj_idx) |>
+  arrange(time_yrs, .by_group = TRUE) |>
+  mutate(visit_num = row_number()) |>
+  filter(subj_idx %in% 1:6) |>
+  ggplot(aes(x = visit_num, y = resid_m2)) +
+  geom_line(colour = "steelblue") +
+  geom_point(colour = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "darkred") +
+  facet_wrap(~subj_idx, labeller = label_both) +
+  labs(title = "Model 2: Within-patient residuals",
+       subtitle = "Are systematic within-patient trends removed?",
+       x = "Visit number", y = "Residual")
+```
+
+**Question 3.5:** Compare these residual plots to those from Model 1.
+Are the within-patient trends removed? Do any patients still show clear slopes?
+
+### 3.9 Posterior Predictive Check
+
+```{r m2-ppc}
+y_rep_m2 <- fit_m2$draws("y_rep", format = "matrix")
+
+ppc_dens_overlay(stan_lme_m2$y, y_rep_m2[1:50, ]) +
+  labs(title = "Model 2 PPC: Density Overlay")
+```
+
+### 3.10 Comparison with Rizopoulos / `lmer()`
+
+```{r m2-rizopoulos}
+# lmer() with random intercept only — same structure as M2
+lmer_m2 <- lmer(log_bili ~ time_yrs + (1 | id), data = long_data,
+                REML = TRUE)
+
+cat("=== lmer() estimates (random intercept only) ===\n")
+print(summary(lmer_m2)$coefficients)
+cat("\nRandom effects (variance components):\n")
+print(as.data.frame(VarCorr(lmer_m2)))
+
+# Build comparison table
+stan_m2_summ <- fit_m2$summary(c("beta0", "beta1", "sigma_u", "sigma")) |>
+  select(variable, mean, q5, q95)
+
+lmer_fe <- fixef(lmer_m2)
+lmer_vc <- as.data.frame(VarCorr(lmer_m2))
+
+comparison_m2 <- tibble(
+  Parameter        = c("β₀ (intercept)", "β₁ (slope/yr)",
+                        "σ_u (random intercept SD)", "σ (residual SD)"),
+  `lmer() REML`    = round(c(lmer_fe["(Intercept)"], lmer_fe["time_yrs"],
+                               lmer_vc$sdcor[1], lmer_vc$sdcor[2]), 3),
+  `Stan M2 median` = round(stan_m2_summ$mean, 3),
+  `Stan 90% CI`    = paste0("[", round(stan_m2_summ$q5, 3), ", ",
+                                 round(stan_m2_summ$q95, 3), "]")
+)
+knitr::kable(comparison_m2,
+             caption = "Model 2: lmer() vs Stan — random intercept model")
+```
+
+**Question 3.6:** Do the `lmer()` REML estimates and Stan M2 posterior medians agree?
+What does Stan add that `lmer()` does not provide?
+
+---
+
+## 4. Model 3: Varying Intercepts and Slopes (Full LME — Primary Model)
+
+### 4.1 Mathematical Model
+
+$$Y_{ij} = (\beta_0 + u_{0i}) + (\beta_1 + u_{1i})\, t_{ij} + \varepsilon_{ij}$$
+
+**Bivariate random effects:**
+
+$$\begin{pmatrix} u_{0i} \\ u_{1i} \end{pmatrix} \sim \mathcal{N}_2\!\left(\mathbf{0},\; \boldsymbol\Sigma_u\right), \qquad \boldsymbol\Sigma_u = \begin{pmatrix} \sigma_{u_0}^2 & \rho_u\,\sigma_{u_0}\sigma_{u_1} \\ \rho_u\,\sigma_{u_0}\sigma_{u_1} & \sigma_{u_1}^2 \end{pmatrix}$$
+
+**Priors (Sorensen parameterisation):**
+
+$$\sigma_{u_0},\,\sigma_{u_1} \sim t_4^+(0,\,1), \qquad \boldsymbol\Omega_u \sim \text{LKJ}(2), \qquad \sigma \sim t_4^+(0,\,1)$$
+
+**Non-centred (Cholesky) form in Stan:**
+$\mathbf{z}_{u,i} \sim \mathcal{N}_2(\mathbf{0}, \mathbf{I})$,
+$\mathbf{u}_i = \text{diag}(\boldsymbol\sigma_u)\,\mathbf{L}_u\,\mathbf{z}_{u,i}$
+where $\mathbf{L}_u$ is the Cholesky factor of $\boldsymbol\Omega_u$.
+
+### 4.2 Compile and Fit
+
+```{r m3-fit}
+mod_m3 <- cmdstan_model("../stan/lme_m3_full.stan")
+
+fit_m3 <- mod_m3$sample(
+  data            = stan_lme_m3,
+  seed            = 123,
+  chains          = 4,
+  parallel_chains = 4,
+  iter_warmup     = 1000,
+  iter_sampling   = 1000,
+  adapt_delta     = 0.95,   # increase to 0.99 if you see divergences
+  refresh         = 500
+)
+```
+
+### 4.3 Convergence Diagnostics
+
+```{r m3-diag}
+fit_m3$diagnostic_summary()
+```
+
+```{r m3-summary}
+fit_m3$summary(
+  c("beta0", "beta1", "sigma_u[1]", "sigma_u[2]", "rho_u", "sigma")
+) |>
+  select(variable, mean, sd, q5, q95, rhat, ess_bulk) |>
+  mutate(
+    variable = c("β₀ (intercept)", "β₁ (slope/yr)",
+                 "σ_{u0} (SD intercepts)", "σ_{u1} (SD slopes)",
+                 "ρ_u (int–slope corr)", "σ (residual SD)"),
+    across(where(is.numeric), \(x) round(x, 3))
+  ) |>
+  knitr::kable(caption = "Model 3: Posterior Summary — Population-Level Parameters")
+```
+
+### 4.4 Trace Plots
+
+```{r m3-trace}
+mcmc_trace(
+  fit_m3$draws(c("beta0", "beta1", "sigma_u[1]", "sigma_u[2]", "rho_u")),
+  facet_args = list(ncol = 2)
+) +
+  labs(title = "Model 3: Trace Plots — Population-Level Parameters")
+```
+
+**Question 4.1:** Does `rho_u` mix as well as the other parameters?
+Why might the intercept–slope correlation be harder to estimate?
+
+### 4.5 Posterior Distributions
+
+```{r m3-posterior}
+mcmc_areas(
+  fit_m3$draws(c("beta0", "beta1", "sigma_u[1]", "sigma_u[2]", "rho_u", "sigma")),
+  prob = 0.90, prob_outer = 0.99
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "red") +
+  labs(title = "Model 3: 90% and 99% Credible Intervals")
+```
+
+### 4.6 Interpreting $\rho_u$: The Intercept–Slope Correlation
+
+```{r m3-rho}
+rho_draws <- fit_m3$draws("rho_u", format = "matrix") |> as.vector()
+
+cat("Posterior summary of ρ_u:\n")
+cat("  Median:", round(median(rho_draws), 3), "\n")
+cat("  90% CI:", round(quantile(rho_draws, c(0.05, 0.95)), 3), "\n")
+cat("  P(ρ_u > 0):", round(mean(rho_draws > 0), 3), "\n")
+
+ggplot(tibble(rho = rho_draws), aes(x = rho)) +
+  geom_histogram(bins = 40, fill = "purple4", colour = "white", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "darkred") +
+  geom_vline(xintercept = median(rho_draws), colour = "darkred", linewidth = 1.2) +
+  labs(title = "Model 3: Posterior of Intercept–Slope Correlation (ρ_u)",
+       subtitle = "Does baseline bilirubin predict the rate of deterioration?",
+       x = "ρ_u", y = "Posterior draws")
+```
+
+**Question 4.2:** What is the posterior median $\hat{\rho}_u$? Is there
+strong evidence it is positive? Interpret this finding clinically: do patients
+with higher baseline bilirubin tend to deteriorate faster?
+
+### 4.7 Population-Level Trajectory
+
+```{r m3-population-traj}
+draws_m3 <- fit_m3$draws(format = "df")
+t_seq    <- seq(0, 14, by = 0.25)
+
+traj_df <- draws_m3 |>
+  slice_sample(n = 200) |>
+  select(beta0, beta1) |>
+  mutate(draw = row_number()) |>
+  crossing(t = t_seq) |>
+  mutate(mu = beta0 + beta1 * t)
+
+ggplot(traj_df, aes(x = t, y = mu, group = draw)) +
+  geom_line(alpha = 0.05, colour = "steelblue") +
+  stat_summary(fun = median, geom = "line",
+               linewidth = 1.5, colour = "darkred") +
+  labs(
+    title = "Model 3: Population Trajectory — 200 Posterior Draws",
+    subtitle = "Each faint line = one posterior draw; dark red = median",
+    x = "Time since enrolment (years)", y = "Mean log(Serum Bilirubin)"
+  )
+```
+
+### 4.8 Patient-Specific Fitted Trajectories (Shrinkage)
+
+```{r m3-patient-traj}
+# Extract posterior mean random effects for all patients
+u_m3   <- fit_m3$draws("u", format = "matrix")
+u0_bar <- colMeans(u_m3[, grepl("u\\[1,", colnames(u_m3))])
+u1_bar <- colMeans(u_m3[, grepl("u\\[2,", colnames(u_m3))])
+
+beta0_hat_m3 <- mean(fit_m3$draws("beta0", format = "matrix"))
+beta1_hat_m3 <- mean(fit_m3$draws("beta1", format = "matrix"))
+
+# Patient-specific fitted trajectories for a sample of 20 patients
+subj_traj <- tibble(
+  subj_idx = 1:n_subj,
+  int_i    = beta0_hat_m3 + u0_bar,
+  slp_i    = beta1_hat_m3 + u1_bar
+) |>
+  filter(subj_idx <= 20) |>
+  crossing(t = seq(0, 14, by = 0.5)) |>
+  mutate(pred = int_i + slp_i * t)
+
+obs_sub20 <- long_data |> filter(subj_idx <= 20)
+
+ggplot() +
+  geom_point(data = obs_sub20,
+             aes(x = time_yrs, y = log_bili, group = subj_idx),
+             alpha = 0.3, size = 0.8, colour = "grey40") +
+  geom_line(data = subj_traj,
+            aes(x = t, y = pred, group = subj_idx),
+            colour = "steelblue", alpha = 0.7, linewidth = 0.8) +
+  labs(
+    title = "Model 3: Patient-Specific Fitted Trajectories — 20 Patients",
+    subtitle = "Blue lines = model-predicted trajectories; dots = observed log(bilirubin)",
+    x = "Time since enrolment (years)", y = "log(Serum Bilirubin)"
+  )
+```
+
+**Question 4.3:** Do the patient-specific trajectories appear to fit the
+observed data well? Are there any patients whose trajectories look unexpected?
+
+### 4.9 Distribution of Random Effects
+
+```{r m3-ranef-dist}
+# Joint distribution of random intercepts and slopes
+ranef_df <- tibble(
+  subj_idx = 1:n_subj,
+  u0       = u0_bar,
+  u1       = u1_bar
+)
+
+ggplot(ranef_df, aes(x = u0, y = u1)) +
+  geom_point(alpha = 0.5, colour = "purple4") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_smooth(method = "lm", se = TRUE, colour = "darkred") +
+  labs(
+    title = "Model 3: Joint Distribution of Random Intercepts and Slopes",
+    subtitle = "Slope of red line reflects ρ_u — positive slope = patients starting high deteriorate faster",
+    x = "Random intercept (u₀ᵢ)", y = "Random slope (u₁ᵢ)"
+  )
+```
+
+**Question 4.4:** Does the scatter plot of $(u_{0i}, u_{1i})$ suggest a positive
+correlation? Is this consistent with the posterior of $\rho_u$?
+
+### 4.10 Posterior Predictive Checks
+
+```{r m3-ppc}
+y_rep_m3 <- fit_m3$draws("y_rep", format = "matrix")
+
+p1 <- ppc_dens_overlay(stan_lme_m3$y, y_rep_m3[1:50, ]) +
+  labs(title = "Density overlay")
+p2 <- ppc_stat(stan_lme_m3$y, y_rep_m3, stat = "mean") +
+  labs(title = "Mean check")
+p3 <- ppc_stat(stan_lme_m3$y, y_rep_m3, stat = "sd") +
+  labs(title = "SD check")
+p4 <- ppc_stat(stan_lme_m3$y, y_rep_m3, stat = "max") +
+  labs(title = "Max check")
+
+(p1 + p2) / (p3 + p4) +
+  plot_annotation(title = "Model 3: Posterior Predictive Checks")
+```
+
+### 4.11 Comparison with Rizopoulos / `lmer()`
+
+```{r m3-rizopoulos}
+# lmer() with random intercept AND slope (correlated) — same structure as M3
+lmer_m3 <- lmer(log_bili ~ time_yrs + (time_yrs | id), data = long_data,
+                REML = TRUE)
+
+cat("=== lmer() estimates (random intercept + slope) ===\n")
+print(summary(lmer_m3)$coefficients)
+cat("\nRandom effects (variance components):\n")
+print(as.data.frame(VarCorr(lmer_m3)))
+
+# Extract Stan M3 posterior summaries
+stan_m3_summ <- fit_m3$summary(
+  c("beta0", "beta1", "sigma_u[1]", "sigma_u[2]", "rho_u", "sigma")
+) |>
+  select(variable, mean, q5, q95)
+
+lmer_fe3  <- fixef(lmer_m3)
+lmer_vc3  <- as.data.frame(VarCorr(lmer_m3))
+lmer_corr <- attr(VarCorr(lmer_m3)$id, "correlation")[2, 1]
+
+comparison_m3 <- tibble(
+  Parameter        = c("β₀ (intercept)", "β₁ (slope/yr)",
+                        "σ_{u0} (intercept SD)", "σ_{u1} (slope SD)",
+                        "ρ_u (int–slope corr)", "σ (residual SD)"),
+  `lmer() REML`    = round(c(lmer_fe3["(Intercept)"], lmer_fe3["time_yrs"],
+                               lmer_vc3$sdcor[1], lmer_vc3$sdcor[2],
+                               lmer_corr, lmer_vc3$sdcor[3]), 3),
+  `Stan M3 median` = round(stan_m3_summ$mean, 3),
+  `Stan 90% CI`    = paste0("[", round(stan_m3_summ$q5, 3), ", ",
+                                 round(stan_m3_summ$q95, 3), "]")
+)
+knitr::kable(comparison_m3,
+             caption = "Model 3: lmer() vs Stan — full LME (Rizopoulos validation)")
+```
+
+**Question 4.5:** How closely do the Stan M3 medians match the `lmer()` REML estimates?
+What does near-perfect agreement confirm? What can you say about $\rho_u$ from Stan
+that you cannot easily quantify from `lmer()`?
+
+---
+
+## 5. Model Comparison via LOO Cross-Validation
+
+### 5.1 Compute LOO Estimates
+
+```{r loo-compute}
+library(loo)
+
+ll_m1 <- fit_m1$draws("log_lik", format = "matrix")
+ll_m2 <- fit_m2$draws("log_lik", format = "matrix")
+ll_m3 <- fit_m3$draws("log_lik", format = "matrix")
+
+loo_m1 <- loo(ll_m1)
+loo_m2 <- loo(ll_m2)
+loo_m3 <- loo(ll_m3)
+
+cat("=== LOO Summary ===\n")
+print(loo_m1)
+print(loo_m2)
+print(loo_m3)
+```
+
+### 5.2 Formal Comparison
+
+```{r loo-compare}
+loo_compare(loo_m1, loo_m2, loo_m3)
+```
+
+### 5.3 Visual Comparison
+
+```{r loo-plot}
+elpd_df <- tibble(
+  model = c("M1: Fixed effects",
+            "M2: Varying intercepts",
+            "M3: Varying int + slopes"),
+  elpd  = c(loo_m1$estimates["elpd_loo", "Estimate"],
+            loo_m2$estimates["elpd_loo", "Estimate"],
+            loo_m3$estimates["elpd_loo", "Estimate"]),
+  se    = c(loo_m1$estimates["elpd_loo", "SE"],
+            loo_m2$estimates["elpd_loo", "SE"],
+            loo_m3$estimates["elpd_loo", "SE"])
+)
+
+ggplot(elpd_df, aes(x = reorder(model, elpd), y = elpd)) +
+  geom_point(size = 4, colour = "steelblue") +
+  geom_errorbar(aes(ymin = elpd - 2*se, ymax = elpd + 2*se),
+                width = 0.2, colour = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "LOO-CV: Predictive Accuracy of Three Models",
+    subtitle = "Higher ELPD = better out-of-sample prediction (error bars = ±2 SE)",
+    x = NULL, y = "ELPD"
+  )
+```
+
+### 5.4 Pareto-k Diagnostics for Model 3
+
+```{r loo-pareto}
+plot(loo_m3, label_points = TRUE)
+title("Model 3: Pareto-k Diagnostics\nk > 0.7 = influential observation")
+```
+
+**Question 5.1:** Are there any observations with Pareto-k > 0.7 in M3?
+If so, which patients do they correspond to, and why might they be influential?
+
+**Question 5.2:** By how many ELPD units does M3 beat M2? Is the difference
+more than 2 standard errors (i.e., clearly meaningful)?
+
+**Question 5.3:** Why does M2 already represent a large jump over M1,
+but M3 provides a more moderate further improvement?
+
+---
+
+## 6. Side-by-Side Model Summary
+
+### 6.1 Parameter Estimates Comparison
+
+```{r all-models-table}
+# Fixed effects
+bind_rows(
+  fit_m1$summary(c("beta0", "beta1", "sigma")) |>
+    mutate(model = "M1: Fixed"),
+  fit_m2$summary(c("beta0", "beta1", "sigma")) |>
+    mutate(model = "M2: Rand. Intercepts"),
+  fit_m3$summary(c("beta0", "beta1", "sigma")) |>
+    mutate(model = "M3: Rand. Int+Slopes")
+) |>
+  select(model, variable, mean, sd, q5, q95) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  knitr::kable(caption = "Fixed Effects Across Models")
+```
+
+**Question 6.1:** Does $\hat\beta_1$ (the population slope) change across
+models? Should we trust the M1 estimate?
+
+### 6.2 PPC Side-by-Side
+
+```{r ppc-side-by-side}
+pa <- ppc_dens_overlay(stan_lme_m1$y, y_rep_m1[1:50, ]) + labs(title = "M1")
+pb <- ppc_dens_overlay(stan_lme_m2$y, y_rep_m2[1:50, ]) + labs(title = "M2")
+pc <- ppc_dens_overlay(stan_lme_m3$y, y_rep_m3[1:50, ]) + labs(title = "M3")
+
+pa + pb + pc +
+  plot_annotation(title = "PPC Comparison: M1, M2, M3")
+```
+
+### 6.3 Summary Table
+
+```{r summary-table}
+tibble(
+  Model        = c("M1: Fixed effects",
+                   "M2: Varying intercepts",
+                   "M3: Varying int + slopes"),
+  `Random effects`   = c("None", "u₀ᵢ ~ N(0, σ²_u0)", "(u₀ᵢ, u₁ᵢ) ~ MVN(0, Σ_u)"),
+  `Parameters`       = c("3", "~316", "~630"),
+  `LOO rank`         = c("3rd (worst)", "2nd", "1st (best)"),
+  `Independence`     = c("Violated", "Improved", "Best"),
+  `Use for JM`       = c("No", "Possible", "Yes")
+) |>
+  knitr::kable(caption = "Three Longitudinal Models — Comparison Summary")
+```
+
+---
+
+## 7. The Latent Trajectory for Session 3
+
+Model 3 defines the latent log-bilirubin trajectory for patient $i$:
+
+$$m_i(t) = (\beta_0 + u_{0i}) + (\beta_1 + u_{1i})\,t$$
+
+In Session 3, this trajectory is **linked to the hazard of death/transplant**:
+
+$$h_i(t) = h_0(t)\,\exp\!\bigl(\mathbf{w}_i^\top\boldsymbol\gamma + \alpha_0\,u_{0i} + \alpha_1\,u_{1i}\bigr)$$
+
+The association parameters $\alpha_0$ and $\alpha_1$ quantify:
+
+- $\alpha_0$: does a higher baseline bilirubin level increase the hazard?
+- $\alpha_1$: does a steeper bilirubin trajectory increase the hazard?
+
+```{r latent-traj-preview}
+# Illustrate the latent trajectory for a few patients
+subj_show <- c(1, 5, 10, 20, 50, 100)
+
+traj_show <- tibble(
+  subj_idx = subj_show,
+  int_i    = beta0_hat_m3 + u0_bar[subj_show],
+  slp_i    = beta1_hat_m3 + u1_bar[subj_show]
+) |>
+  crossing(t = seq(0, 14, by = 0.1)) |>
+  mutate(
+    m_t      = int_i + slp_i * t,
+    label    = paste0("Patient ", subj_idx,
+                      "\n(u0=", round(u0_bar[subj_idx], 2),
+                      ", u1=", round(u1_bar[subj_idx], 2), ")")
+  )
+
+ggplot(traj_show, aes(x = t, y = m_t, colour = factor(subj_idx), group = factor(subj_idx))) +
+  geom_line(linewidth = 1.2) +
+  labs(
+    title = "Latent Trajectories m_i(t) for Selected Patients",
+    subtitle = "These trajectories will link to survival risk in Session 3",
+    x = "Time (years)", y = expression(m[i](t) == log~bilirubin~trajectory),
+    colour = "Patient"
+  )
+```
+
+---
+
+## Summary
+
+| Concept | Key takeaway |
+|---------|-------------|
+| Within-patient correlation | Ignored by M1 → biased SEs |
+| ICC | Quantifies how much of variance is between patients |
+| Random intercepts | Capture stable patient-level baselines |
+| Non-centred parameterisation | Avoids funnel geometry; essential for hierarchical Stan models |
+| LKJ prior | Regularises the correlation between intercepts and slopes |
+| Shrinkage | Patients with few observations borrow from the group — reduces prediction error |
+| LOO-CV | M3 wins; each added level of random effects improves predictive accuracy |
+| Latent trajectory $m_i(t)$ | M3 output fed into the joint model in Session 3 |
+
+**Model 3 is the longitudinal submodel for Session 3:**
+
+$$m_i(t) = (\beta_0 + u_{0i}) + (\beta_1 + u_{1i})\,t$$
+
+The posterior draws of $(u_{0i},\, u_{1i})$ carry uncertainty about each patient's
+trajectory into the joint model — this is what makes the joint model fully Bayesian.

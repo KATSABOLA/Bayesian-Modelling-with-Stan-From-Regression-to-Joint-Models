@@ -1,0 +1,1192 @@
+---
+title: "Session 2 Practical: Bayesian Survival Analysis"
+subtitle: "Three PH Models and Competing Risks Applied to PBC Data"
+author: "Hillary Katsabola"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    theme: flatly
+    highlight-style: github
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  cache: false
+---
+
+## Overview
+
+In this practical you will:
+
+1. Explore the **PBC survival dataset** (`survival::pbc`) and fit the Kaplan-Meier estimator
+2. Fit **three Bayesian parametric PH survival models** in Stan:
+   - **Model 1 — Exponential:** constant hazard rate; memoryless baseline
+   - **Model 2 — Weibull:** monotone hazard; $\alpha > 1$ gives increasing risk over time
+   - **Model 3 — Gompertz:** exponentially changing hazard; $\rho > 0$ means accelerating risk
+3. Visualise the **posterior hazard function** for each model
+4. Compare models using **LOO-CV** and **Cox-Snell residuals**
+5. Extend to **competing risks** (transplant vs.\ death) using cause-specific Gompertz hazards
+6. Compare all results against frequentist benchmarks from Rizopoulos (2012)
+
+All three single-event models share the **proportional hazards (PH)** structure:
+
+$$h(t \mid \mathbf{x}_i) = h_0(t)\,\exp(\mathbf{x}_i'\boldsymbol{\gamma})$$
+
+where $h_0(t)$ is the baseline hazard and $\exp(\gamma_k)$ is the **hazard ratio** (HR)
+for covariate $k$.  The models differ only in their assumed shape for $h_0(t)$.
+
+> **Why only PH models?**
+> Session 3 (joint models) requires evaluating $H_i(T_i)$ analytically at every posterior
+> draw.  Exponential, Weibull, and Gompertz all have closed-form $H_0(t)$ — no numerical
+> quadrature needed inside Stan.  Gompertz is ultimately chosen for the joint model because
+> it additionally captures exponential hazard acceleration.
+
+---
+
+## Setup
+
+```{r setup}
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(loo)
+library(tidyverse)
+library(survival)
+library(survminer)
+library(flexsurv)
+library(patchwork)
+
+color_scheme_set("teal")
+```
+
+---
+
+## 1. Data Exploration
+
+```{r data-prep}
+source("../R/data_prep.R")
+
+cat("N subjects       :", stan_surv$N, "\n")
+cat("Events           :", sum(stan_surv$event), "\n")
+cat("Censored         :", sum(stan_surv$event == 0), "\n")
+cat("Event rate       :", round(mean(stan_surv$event), 3), "\n")
+cat("Follow-up (years):",
+    round(min(stan_surv$t_event), 2), "–",
+    round(max(stan_surv$t_event), 2), "\n")
+```
+
+The **PBC dataset** (Mayo Clinic, 1974–1984) enrolled 418 patients with primary biliary
+cirrhosis; 312 were randomised to D-penicillamine or placebo.  The outcome here is the
+combined endpoint of death **or** liver transplant (`event = 1`); all remaining patients
+are right-censored.
+
+Covariates in the Stan data matrix `X_surv` (columns 1–4):
+
+| Column | Variable | Interpretation |
+|--------|----------|----------------|
+| 1 | `trt_bin` | Drug (1 = D-penicillamine, 0 = placebo) |
+| 2 | `female` | Sex (1 = female) |
+| 3 | `age_sc` | Age (scaled by ~10 years) |
+| 4 | `stage_num` | Histological stage (1–4) |
+
+### Kaplan-Meier estimate
+
+```{r km-plot}
+surv_df <- tibble(time = stan_surv$t_event, event = stan_surv$event)
+km_fit  <- survfit(Surv(time, event) ~ 1, data = surv_df)
+
+ggsurvplot(km_fit, data = surv_df,
+           conf.int   = TRUE,
+           risk.table = TRUE,
+           palette    = "darkblue",
+           title      = "Kaplan-Meier: PBC Survival (combined endpoint)",
+           xlab       = "Time (years)",
+           ylab       = "Survival probability")
+```
+
+```{r km-summary}
+cat("Median survival (KM):", round(summary(km_fit)$table["median"], 2), "years\n")
+cat("5-year survival     :", round(summary(km_fit, times = 5)$surv, 3), "\n")
+cat("10-year survival    :", round(summary(km_fit, times = 10)$surv, 3), "\n")
+```
+
+> **Key observation:** The survival function steepens over time, indicating that the hazard
+> **accelerates** with disease duration.  This visual evidence against a constant hazard
+> (exponential model) motivates the Weibull and Gompertz alternatives.
+
+**Question 1.1:** At what year does the KM survival probability first drop below 0.5?
+
+**Question 1.2:** Looking at the shape of the KM curve, do you anticipate $\hat\alpha > 1$
+(Weibull) and $\hat\rho > 0$ (Gompertz)?  Why?
+
+---
+
+## 2. Model 1: Exponential (Constant Hazard)
+
+The **exponential model** is the simplest parametric survival model.  It assumes the
+instantaneous event rate is **constant over time** — the so-called *memoryless* property:
+
+$$h(t \mid \mathbf{x}_i) = \lambda\,\exp(\mathbf{x}_i'\boldsymbol{\gamma}), \qquad
+  H(t \mid \mathbf{x}_i) = \lambda\,t\,\exp(\mathbf{x}_i'\boldsymbol{\gamma})$$
+
+Parameters:
+
+- $\lambda > 0$: the baseline event rate (events per year for the reference patient)
+- $\boldsymbol{\gamma}$: log-hazard ratios; $\exp(\gamma_k)$ = HR for covariate $k$
+
+**Likelihood contributions:**
+
+| Observation type | Stan `target +=` | Intuition |
+|------------------|-----------------|-----------|
+| Event ($\delta_i=1$) | $\log\lambda + \mathbf{x}_i'\boldsymbol{\gamma} - H_i(t_i)$ | The density $f(t_i) = h(t_i)\,S(t_i)$ |
+| Censored ($\delta_i=0$) | $-H_i(t_i)$ | Survived at least to $t_i$: $S(t_i)$ |
+
+**Priors (weakly informative):**
+
+- $\lambda \sim \text{Gamma}(1,1)$: mean rate = 1 event/year; broad but positive
+- $\boldsymbol{\gamma} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$: regularising; HRs centred at 1 on the HR scale
+
+**Median survival** for the reference patient: $t_{1/2} = \log 2 / \lambda$
+
+### 2.1 Fitting the model
+
+```{r exp-fit}
+mod_exp <- cmdstan_model("../stan/surv_exponential.stan")
+
+fit_exp <- mod_exp$sample(
+  data            = stan_surv,
+  seed            = 123,
+  chains          = 4,
+  parallel_chains = 4,
+  iter_warmup     = 1000,
+  iter_sampling   = 1000,
+  refresh         = 500
+)
+
+fit_exp$diagnostic_summary()
+```
+
+### 2.2 Posterior Summary
+
+```{r exp-summary}
+fit_exp$summary(c("lambda", "gamma", "HR", "t_median_ref")) |>
+  select(variable, mean, sd, q5, q95, rhat, ess_bulk) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  knitr::kable(caption = "Exponential Model: Posterior Summary")
+```
+
+**Interpreting the output:**
+
+- `lambda`: posterior mean event rate for the reference patient.  For example,
+  $\hat\lambda \approx 0.069$ means roughly **6.9 events per 100 person-years**.
+- `HR[1]` (drug): an HR $< 1$ indicates a protective effect of D-penicillamine.
+- `HR[3]` (age): an HR $> 1$ means older patients face higher risk per unit of
+  standardised age.
+- `t_median_ref`: median survival for the reference patient.  For the exponential this
+  equals $\log 2 / \lambda$ exactly; you can verify with the formula below.
+- `rhat` $< 1.01$ and `ess_bulk` $> 400$ confirm good MCMC convergence.
+
+```{r exp-median-check}
+# Verify t_median = log(2) / lambda analytically
+lambda_mean <- fit_exp$summary("lambda")$mean
+cat("Analytical median (log2 / lambda_mean):", round(log(2) / lambda_mean, 2), "years\n")
+cat("Stan t_median_ref posterior mean       :",
+    round(fit_exp$summary("t_median_ref")$mean, 2), "years\n")
+```
+
+### 2.3 Trace Plots & Convergence
+
+```{r exp-trace}
+mcmc_trace(
+  fit_exp$draws(c("lambda", "gamma[1]", "gamma[2]")),
+  facet_args = list(ncol = 1)
+) +
+  labs(title    = "Exponential Model: Trace Plots",
+       subtitle = "Good mixing: chains should overlap ('hairy caterpillar') with no drift")
+```
+
+Healthy MCMC chains show:
+
+1. All four chains exploring the **same parameter region** (complete overlap)
+2. **Fast within-chain mixing** (no long runs in one direction — low autocorrelation)
+3. **Stationarity**: no upward or downward trend across iterations
+
+### 2.4 Posterior Hazard Function
+
+Since $h(t \mid \mathbf{x}_i) = \lambda\exp(\mathbf{x}_i'\boldsymbol{\gamma})$, the
+baseline hazard ($\mathbf{x}_i = \mathbf{0}$) is simply $h_0(t) = \lambda$ — a
+horizontal line.  The posterior uncertainty about $\lambda$ translates directly to
+uncertainty about the **level** of that flat hazard:
+
+```{r exp-hazard}
+lambda_samp <- fit_exp$draws("lambda", format = "matrix") |> as.vector()
+t_haz <- seq(0.01, 15, length.out = 150)
+set.seed(42)
+idx_h <- sample(length(lambda_samp), 400)
+
+haz_exp_df <- map_dfr(idx_h, \(s) tibble(t = t_haz, h = lambda_samp[s])) |>
+  group_by(t) |>
+  summarise(h_med = median(h),
+            h_lo  = quantile(h, 0.05, na.rm = TRUE),
+            h_hi  = quantile(h, 0.95, na.rm = TRUE))
+
+ggplot(haz_exp_df, aes(x = t, y = h_med)) +
+  geom_line(colour = "steelblue", linewidth = 1.2) +
+  geom_ribbon(aes(ymin = h_lo, ymax = h_hi), fill = "steelblue", alpha = 0.25) +
+  labs(title    = "Exponential: Posterior Baseline Hazard h₀(t)",
+       subtitle = "Constant hazard — the memoryless assumption",
+       x = "Time (years)", y = "h(t)") +
+  coord_cartesian(ylim = c(0, 0.18))
+```
+
+The **flat hazard** is the key assumption: the instantaneous risk of the event is
+identical whether you are at year 1 or year 10.  For PBC — a **progressive** disease —
+this is biologically questionable.
+
+### 2.5 Posterior Survival Curve
+
+```{r exp-survival}
+# Posterior survival S(t) = exp(-lambda * t) for reference patient
+surv_exp_df <- map_dfr(idx_h, \(s) {
+  tibble(t = t_haz, S = exp(-lambda_samp[s] * t_haz))
+}) |>
+  group_by(t) |>
+  summarise(S_med = median(S),
+            S_lo  = quantile(S, 0.05, na.rm = TRUE),
+            S_hi  = quantile(S, 0.95, na.rm = TRUE))
+
+# KM reference (used again in Section 5)
+km_df <- tibble(t = km_fit$time, S = km_fit$surv,
+                S_lo = km_fit$lower, S_hi = km_fit$upper)
+
+ggplot() +
+  geom_step(data = km_df, aes(x = t, y = S), linewidth = 1.1, colour = "black") +
+  geom_ribbon(data = km_df, aes(x = t, ymin = S_lo, ymax = S_hi),
+              alpha = 0.15, fill = "black") +
+  geom_line(data = surv_exp_df, aes(x = t, y = S_med),
+            colour = "steelblue", linewidth = 1.1) +
+  geom_ribbon(data = surv_exp_df, aes(x = t, ymin = S_lo, ymax = S_hi),
+              fill = "steelblue", alpha = 0.25) +
+  labs(title    = "Exponential: Posterior Survival Curve vs Kaplan-Meier",
+       subtitle = "Black = KM (95% CI shaded); Blue = Exponential posterior (reference patient)",
+       x = "Time (years)", y = "S(t)") +
+  ylim(0, 1) + theme_minimal()
+```
+
+### 2.6 Comparison with Rizopoulos / `coxph()`
+
+```{r exp-rizopoulos}
+cox_fit <- coxph(
+  Surv(time_yrs, event) ~ trt_bin + female + age_sc + stage_num,
+  data = surv_data
+)
+
+cat("=== Cox PH model (Rizopoulos reference — 4 covariates) ===\n")
+print(summary(cox_fit)$coefficients[, c("coef", "exp(coef)", "se(coef)", "Pr(>|z|)")])
+
+stan_exp_hr <- fit_exp$summary("HR") |> select(variable, mean, q5, q95)
+cox_hr      <- exp(coef(cox_fit))
+
+comparison_exp <- tibble(
+  Covariate     = c("Drug (trt_bin)", "Female", "Age (scaled)", "Stage"),
+  `Cox HR`      = round(cox_hr, 3),
+  `Stan Exp HR` = round(stan_exp_hr$mean, 3),
+  `Stan 90% CI` = paste0("[", round(stan_exp_hr$q5, 3), ", ",
+                              round(stan_exp_hr$q95, 3), "]")
+)
+knitr::kable(comparison_exp,
+             caption = "Exponential model vs Cox PH (Rizopoulos comparison)")
+```
+
+The Cox PH model is **semi-parametric**: it estimates regression coefficients without
+specifying $h_0(t)$.  The Bayesian exponential constrains $h_0(t) = \lambda$ (constant).
+Close agreement between the two suggests that the constant-hazard assumption does not
+severely bias the HR estimates — but we can do better with a more flexible $h_0(t)$.
+
+**Question 2.1:** Use the formula $t_{1/2} = \log 2 / \lambda$ to verify the `t_median_ref`
+posterior mean.  What does this number tell you about a typical PBC patient?
+
+**Question 2.2:** Is the drug HR credibly different from 1.0?  How would you communicate
+this uncertainty to a clinician?
+
+**Question 2.3:** What biological property of PBC makes the memoryless (constant hazard)
+assumption unrealistic?
+
+---
+
+## 3. Model 2: Weibull (Monotone Hazard)
+
+The **Weibull model** extends the exponential by allowing the hazard to change
+*monotonically* over time via a shape parameter $\alpha$:
+
+$$h_0(t) = \alpha\, e^{-\alpha\mu}\, t^{\alpha-1}, \qquad
+  H_0(t) = \left(\frac{t}{e^\mu}\right)^\alpha$$
+
+$$h(t \mid \mathbf{x}_i) = h_0(t)\,\exp(\mathbf{x}_i'\boldsymbol{\gamma}), \qquad
+  H(t \mid \mathbf{x}_i) = \left(\frac{t}{e^{\mu + \mathbf{x}_i'\boldsymbol{\gamma}/\alpha}}\right)^\alpha$$
+
+**Shape parameter $\alpha$:**
+
+| $\alpha$ | Hazard shape | Typical context |
+|----------|-------------|-----------------|
+| $\alpha < 1$ | Decreasing | Post-surgical recovery, early mortality |
+| $\alpha = 1$ | Constant | Reduces exactly to Exponential |
+| $\alpha > 1$ | Increasing | Progressive disease, ageing, cancer |
+
+**Bayesian advantage:** Instead of a Wald test ($H_0: \alpha = 1$), we compute the exact
+posterior probability $P(\alpha > 1 \mid \mathbf{y})$ — a direct probabilistic statement
+requiring no asymptotic approximation.
+
+**Scale parameter:** $e^\mu$ is the characteristic time of the distribution.
+The median survival for the reference patient is $t_{1/2} = e^\mu\cdot(\log 2)^{1/\alpha}$.
+
+**Priors:**
+
+- $\alpha \sim \text{Gamma}(2,1)$: mean 2, standard deviation $\sqrt{2}$; allows both sides of 1
+- $\mu \sim \mathcal{N}(2, 4)$: log-scale centred at ~7 years
+- $\boldsymbol{\gamma} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$
+
+### 3.1 Fitting the model
+
+```{r weibull-fit}
+mod_wb <- cmdstan_model("../stan/surv_weibull.stan")
+
+fit_wb <- mod_wb$sample(
+  data            = stan_surv,
+  seed            = 123,
+  chains          = 4,
+  parallel_chains = 4,
+  iter_warmup     = 1000,
+  iter_sampling   = 1000,
+  refresh         = 500
+)
+
+fit_wb$diagnostic_summary()
+```
+
+### 3.2 Posterior Summary
+
+```{r weibull-summary}
+fit_wb$summary(c("alpha", "mu", "HR")) |>
+  select(variable, mean, sd, q5, q95, rhat, ess_bulk) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  knitr::kable(caption = "Weibull Model: Posterior Summary")
+```
+
+**Interpreting the output:**
+
+- `alpha`: the shape parameter.  The 90% credible interval `[q5, q95]` is a
+  **direct probability statement**: "There is a 90% posterior probability that $\alpha$
+  lies in this range given the data."  This is the Bayesian analogue of a confidence
+  interval, but with a natural probabilistic interpretation.
+- `mu`: the log-scale.  The scale $e^\mu$ controls the time horizon of the distribution.
+- `HR[k]`: hazard ratios have the same interpretation as in the exponential model.
+
+```{r weibull-scale}
+# Scale parameter and implied median survival
+mu_mean    <- fit_wb$summary("mu")$mean
+alpha_mean <- fit_wb$summary("alpha")$mean
+cat("Scale e^mu (posterior mean) :", round(exp(mu_mean), 2), "years\n")
+cat("Implied median survival     :", round(exp(mu_mean) * log(2)^(1/alpha_mean), 2), "years\n")
+```
+
+### 3.3 Trace Plots
+
+```{r weibull-trace}
+mcmc_trace(
+  fit_wb$draws(c("alpha", "mu", "gamma[1]", "gamma[2]")),
+  facet_args = list(ncol = 2)
+) +
+  labs(title    = "Weibull Model: Trace Plots",
+       subtitle = "Both shape (alpha) and scale (mu) should converge without correlation")
+```
+
+### 3.4 Bayesian Test of Increasing Hazard
+
+```{r weibull-alpha}
+alpha_draws <- fit_wb$draws("alpha", format = "matrix") |> as.vector()
+mu_draws_wb <- fit_wb$draws("mu",    format = "matrix") |> as.vector()
+
+cat("=== Posterior of alpha (shape) ===\n")
+cat("  Mean  :", round(mean(alpha_draws), 3), "\n")
+cat("  Median:", round(median(alpha_draws), 3), "\n")
+cat("  90% CI:", round(quantile(alpha_draws, c(0.05, 0.95)), 3), "\n")
+cat("  P(alpha > 1):", round(mean(alpha_draws > 1), 4), "\n\n")
+
+# Posterior median survival (reference patient)
+t_med_wb <- exp(mu_draws_wb) * log(2)^(1 / alpha_draws)
+cat("=== Implied median survival (reference patient) ===\n")
+cat("  Median:", round(median(t_med_wb), 2), "yr\n")
+cat("  90% CI:", round(quantile(t_med_wb, c(0.05, 0.95)), 2), "\n")
+
+ggplot(tibble(alpha = alpha_draws), aes(x = alpha)) +
+  geom_histogram(bins = 50, fill = "steelblue", colour = "white", alpha = 0.85) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "darkred", linewidth = 1.2) +
+  annotate("text", x = 1.04, y = Inf, vjust = 2, hjust = 0, size = 4,
+           colour = "darkred",
+           label = paste0("P(α > 1) = ", round(mean(alpha_draws > 1), 4))) +
+  labs(title    = "Weibull: Posterior Distribution of Shape Parameter α",
+       subtitle = "Red dashed line = α = 1 (exponential boundary); mass above 1 = evidence for increasing hazard",
+       x = expression(alpha ~ "(Weibull shape)"), y = "Count")
+```
+
+$P(\alpha > 1 \mid \mathbf{y})$ is the **Bayesian analogue** of a one-sided hypothesis
+test for $H_0: \alpha \le 1$.  Unlike a $p$-value, it is directly interpretable:
+"Given these data, there is a [probability] chance that the hazard increases monotonically
+with time."
+
+### 3.5 Posterior Hazard Function
+
+```{r weibull-hazard}
+# Weibull baseline hazard for reference patient (x = 0):
+# h_0(t) = alpha * exp(-alpha * mu) * t^(alpha - 1)
+t_haz_w <- seq(0.1, 15, length.out = 150)
+set.seed(42); idx_w <- sample(length(alpha_draws), 400)
+
+haz_wb_df <- map_dfr(idx_w, \(s) {
+  a <- alpha_draws[s]; m <- mu_draws_wb[s]
+  tibble(t = t_haz_w,
+         h = a * exp(-a * m) * t_haz_w^(a - 1))
+}) |>
+  group_by(t) |>
+  summarise(h_med = median(h),
+            h_lo  = quantile(h, 0.05, na.rm = TRUE),
+            h_hi  = quantile(h, 0.95, na.rm = TRUE))
+
+ggplot(haz_wb_df, aes(x = t, y = h_med)) +
+  geom_line(colour = "darkorange", linewidth = 1.2) +
+  geom_ribbon(aes(ymin = h_lo, ymax = h_hi), fill = "darkorange", alpha = 0.25) +
+  labs(title    = "Weibull: Posterior Baseline Hazard h₀(t)",
+       subtitle = "Monotonically increasing (α > 1): risk grows as a power of time",
+       x = "Time (years)", y = "h(t) — instantaneous hazard rate")
+```
+
+The **increasing power-law hazard** captures the progressive nature of PBC: risk
+accumulates steadily as disease advances.  Compare this to the flat exponential hazard —
+the Weibull clearly better reflects the biology.
+
+### 3.6 Comparison with Rizopoulos / `flexsurvreg()`
+
+```{r weibull-rizopoulos}
+# flexsurv Weibull (AFT) — same 4 covariates; used to verify alpha
+fsurv_wb <- flexsurvreg(
+  Surv(time_yrs, event) ~ trt_bin + female + age_sc + stage_num,
+  dist = "weibull", data = surv_data
+)
+
+cat("=== flexsurv Weibull MLE ===\n")
+cat("  Shape (alpha) MLE :", round(exp(coef(fsurv_wb)["shape"]), 3), "\n")
+cat("  Stan alpha mean   :", round(fit_wb$summary("alpha")$mean, 3), "\n\n")
+
+# HR comparison: Cox (Rizopoulos) vs Stan Weibull
+stan_wb_hr <- fit_wb$summary("HR") |> select(variable, mean, q5, q95)
+
+comparison_wb <- tibble(
+  Covariate         = c("Drug (trt_bin)", "Female", "Age (scaled)", "Stage"),
+  `Cox HR`          = round(exp(coef(cox_fit)), 3),
+  `Stan Weibull HR` = round(stan_wb_hr$mean, 3),
+  `Stan 90% CI`     = paste0("[", round(stan_wb_hr$q5, 3), ", ",
+                                  round(stan_wb_hr$q95, 3), "]")
+)
+knitr::kable(comparison_wb,
+             caption = "Weibull HRs: Cox PH (Rizopoulos reference) vs Stan Bayesian Weibull")
+```
+
+The `flexsurv` MLE of $\alpha$ provides a **frequentist reference point**.
+Close agreement between the MLE and the Stan posterior mean confirms that
+the prior for $\alpha$ is not dominating the likelihood.
+
+**Question 3.1:** What is $P(\alpha > 1 \mid \mathbf{y})$?  State this as an informal
+Bayesian hypothesis test and compare with a frequentist interpretation.
+
+**Question 3.2:** Compute the implied median survival from the posterior of $\alpha$ and
+$\mu$.  Is it consistent with the Exponential model's `t_median_ref`?
+
+**Question 3.3:** Looking at the hazard plot, how does $h(t)$ at year 10 compare to year 1?
+Express this as a ratio.
+
+---
+
+## 4. Model 3: Gompertz (Exponential Hazard)
+
+The **Gompertz model** allows the hazard to grow or decay *exponentially* over time:
+
+$$h(t \mid \mathbf{x}_i) = \lambda\, e^{\rho t}\, \exp(\mathbf{x}_i'\boldsymbol{\gamma})$$
+
+$$H(t \mid \mathbf{x}_i) = \frac{\lambda}{\rho}\!\left(e^{\rho t} - 1\right)\exp(\mathbf{x}_i'\boldsymbol{\gamma})
+  \quad [\rho \ne 0]$$
+
+Parameters:
+
+- $\lambda > 0$: the hazard at time $t = 0$ (initial hazard rate)
+- $\rho$: the **hazard growth rate** (unconstrained; positive = growth, negative = decay)
+- $\boldsymbol{\gamma}$: log-HRs (identical interpretation to exponential/Weibull)
+
+**Hazard shape by $\rho$:**
+
+| $\rho$ | Shape | Clinical context |
+|---------|-------|-----------------|
+| $\rho > 0$ | Exponentially increasing | Progressive disease (PBC, cancer, ageing) |
+| $\rho = 0$ | Constant | Reduces exactly to Exponential |
+| $\rho < 0$ | Exponentially decreasing | Post-surgical benefit, waning risk |
+
+**Hazard doubling time:** When $\rho > 0$, the hazard doubles every $\log 2 / \rho$ years.
+
+**Numerical stability:** The formula $\frac{\lambda}{\rho}(e^{\rho t} - 1)$ is unstable
+when $|\rho| \approx 0$.  The Stan code guards this with
+`abs(rho) > 1e-6`, falling back to $\lambda t$ (the exponential limit) via L'Hôpital's rule.
+
+**Priors:**
+
+- $\lambda \sim \text{Gamma}(1,1)$: same as exponential
+- $\rho \sim \mathcal{N}(0, 1)$: allows both growth ($\rho > 0$) and decay ($\rho < 0$)
+- $\boldsymbol{\gamma} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$
+
+### 4.1 Fitting the model
+
+```{r gompertz-fit}
+mod_gz <- cmdstan_model("../stan/surv_gompertz.stan")
+
+fit_gz <- mod_gz$sample(
+  data            = stan_surv,
+  seed            = 123,
+  chains          = 4,
+  parallel_chains = 4,
+  iter_warmup     = 1000,
+  iter_sampling   = 1000,
+  refresh         = 500
+)
+
+fit_gz$diagnostic_summary()
+```
+
+### 4.2 Posterior Summary
+
+```{r gompertz-summary}
+fit_gz$summary(c("lambda", "rho", "HR", "increasing_hazard")) |>
+  select(variable, mean, sd, q5, q95, rhat, ess_bulk) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  knitr::kable(caption = "Gompertz Model: Posterior Summary")
+```
+
+**Interpreting the output:**
+
+- `lambda`: the initial hazard at $t = 0$.  This will be much smaller than the
+  exponential model's $\hat\lambda$ because the Gompertz hazard starts low and
+  then accelerates.
+- `rho`: the growth rate.  If the entire 90% CI is positive, the data strongly support
+  increasing hazard.
+- `increasing_hazard`: a **binary generated quantity** in Stan — it equals 1 for each
+  posterior draw where $\rho > 0$.  Its posterior mean is exactly
+  $P(\rho > 0 \mid \mathbf{y})$, the Bayesian posterior probability of increasing hazard.
+- `HR[k]`: identical interpretation to Exponential and Weibull.
+
+### 4.3 Trace Plots
+
+```{r gompertz-trace}
+mcmc_trace(
+  fit_gz$draws(c("lambda", "rho", "gamma[1]", "gamma[2]")),
+  facet_args = list(ncol = 2)
+) +
+  labs(title    = "Gompertz Model: Trace Plots",
+       subtitle = "Note: rho is unconstrained (can be negative) — its posterior should be well-identified")
+```
+
+### 4.4 Posterior of $\rho$ — Evidence for Increasing Hazard
+
+```{r gompertz-rho}
+rho_draws  <- fit_gz$draws("rho",    format = "matrix") |> as.vector()
+lam_draws  <- fit_gz$draws("lambda", format = "matrix") |> as.vector()
+
+cat("=== Posterior of rho (hazard growth rate) ===\n")
+cat("  Mean  :", round(mean(rho_draws), 3), "\n")
+cat("  Median:", round(median(rho_draws), 3), "\n")
+cat("  90% CI:", round(quantile(rho_draws, c(0.05, 0.95)), 3), "\n")
+cat("  P(rho > 0):", round(mean(rho_draws > 0), 4), "\n")
+
+rho_med <- median(rho_draws)
+if (rho_med > 0) {
+  cat("  Hazard doubling time (log2 / rho_median):",
+      round(log(2) / rho_med, 1), "years\n")
+}
+
+mcmc_areas(fit_gz$draws(), pars = "rho", prob = 0.90) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "red") +
+  labs(title    = "Gompertz: Posterior Distribution of ρ (hazard growth rate)",
+       subtitle = "ρ > 0 = hazard increases over time; ρ = 0 (red) = exponential boundary")
+```
+
+The **hazard doubling time** $\log 2 / \hat\rho$ translates the abstract growth rate
+into a clinically meaningful statement: roughly every ___ years, the instantaneous risk
+of death or transplant doubles.
+
+### 4.5 Posterior Hazard Function
+
+```{r gompertz-hazard}
+# Gompertz baseline hazard for reference patient (x = 0):
+# h_0(t) = lambda * exp(rho * t)
+t_haz_g <- seq(0, 15, length.out = 150)
+set.seed(42); idx_g <- sample(length(rho_draws), 400)
+
+haz_gz_df <- map_dfr(idx_g, \(s) {
+  tibble(t = t_haz_g,
+         h = lam_draws[s] * exp(rho_draws[s] * t_haz_g))
+}) |>
+  group_by(t) |>
+  summarise(h_med = median(h),
+            h_lo  = quantile(h, 0.05, na.rm = TRUE),
+            h_hi  = quantile(h, 0.95, na.rm = TRUE))
+
+ggplot(haz_gz_df, aes(x = t, y = h_med)) +
+  geom_line(colour = "firebrick", linewidth = 1.2) +
+  geom_ribbon(aes(ymin = h_lo, ymax = h_hi), fill = "firebrick", alpha = 0.25) +
+  labs(title    = "Gompertz: Posterior Baseline Hazard h₀(t)",
+       subtitle = "Exponential acceleration: h(t) = λ·exp(ρ·t)",
+       x = "Time (years)", y = "h(t)")
+```
+
+The **exponential growth** of the Gompertz hazard contrasts with the Weibull's power-law
+growth.  Both are consistent with increasing hazard, but with different curvatures.
+
+### 4.6 Comparison with Rizopoulos / `coxph()` and `flexsurvreg()`
+
+```{r gompertz-rizopoulos}
+# cox_fit was defined in Section 2; reused here
+cat("=== Cox PH model (Rizopoulos reference) ===\n")
+print(summary(cox_fit)$coefficients[, c("coef", "exp(coef)", "se(coef)")])
+
+# flexsurv Gompertz — PH parameterization; exp(coef) gives HR directly
+fsurv_gz <- flexsurvreg(
+  Surv(time_yrs, event) ~ trt_bin + female + age_sc + stage_num,
+  dist = "gompertz", data = surv_data
+)
+
+stan_gz_hr <- fit_gz$summary("HR") |> select(variable, mean, q5, q95)
+
+comparison_gz <- tibble(
+  Covariate        = c("Drug (trt_bin)", "Female", "Age (scaled)", "Stage"),
+  `Rizopoulos Cox` = round(exp(coef(cox_fit)), 3),
+  `flexsurv Gomp.` = round(exp(coef(fsurv_gz)[c("trt_bin", "female", "age_sc", "stage_num")]), 3),
+  `Stan Gompertz`  = round(stan_gz_hr$mean, 3),
+  `Stan 90% CI`    = paste0("[", round(stan_gz_hr$q5, 3), ", ",
+                                 round(stan_gz_hr$q95, 3), "]")
+)
+knitr::kable(comparison_gz,
+             caption = "Gompertz HRs: Cox PH (Rizopoulos) vs flexsurv MLE vs Stan Bayesian")
+```
+
+**Question 4.1:** What is $P(\rho > 0 \mid \mathbf{y})$?  State this as a Bayesian
+posterior probability and interpret it clinically.
+
+**Question 4.2:** Compute the hazard doubling time from the posterior median of $\rho$.
+Does this make clinical sense for PBC progression?
+
+**Question 4.3:** Compare `HR[3]` (age) across Exponential, Weibull, and Gompertz models.
+Are they consistent?  What does consistency across three different $h_0(t)$ assumptions
+tell you?
+
+---
+
+## 5. Model Comparison
+
+Now we formally compare the three PH models using LOO-CV, Cox-Snell residuals,
+and survival curve overlays.
+
+### 5.1 LOO-CV
+
+**LOO (Leave-One-Out cross-validation)** estimates out-of-sample predictive accuracy
+without refitting.  Higher ELPD (expected log predictive density) is better.
+LOOIC $= -2 \times \text{ELPD}$, analogous to AIC.
+
+A $|\Delta\text{ELPD}| > 2 \times \text{SE}$ is considered a meaningful difference.
+
+```{r loo-comparison}
+get_ll <- function(fit, var = "log_lik") fit$draws(var, format = "matrix")
+
+loo_exp <- loo(get_ll(fit_exp))
+loo_wb  <- loo(get_ll(fit_wb))
+loo_gz  <- loo(get_ll(fit_gz))
+
+loo_compare(loo_exp, loo_wb, loo_gz)
+```
+
+```{r loo-table}
+loo_list <- list(Exponential = loo_exp, Weibull = loo_wb, Gompertz = loo_gz)
+
+loo_table <- map_dfr(names(loo_list), function(nm) {
+  lo <- loo_list[[nm]]
+  tibble(
+    Model = nm,
+    ELPD  = round(lo$estimates["elpd_loo", "Estimate"], 1),
+    SE    = round(lo$estimates["elpd_loo", "SE"], 1),
+    LOOIC = round(-2 * lo$estimates["elpd_loo", "Estimate"], 1)
+  )
+}) |>
+  arrange(desc(ELPD))
+
+knitr::kable(loo_table, caption = "LOO-CV: Three PH Survival Models (higher ELPD = better fit)")
+```
+
+### 5.2 Cox-Snell Residuals
+
+**Cox-Snell residuals** $r_i = H(t_i \mid \mathbf{x}_i)$ should follow $\text{Exp}(1)$
+under a correctly specified model.  We assess this by plotting the Kaplan-Meier estimate
+of the residuals against the $\exp(-r)$ reference line: **good fit = curves coincide**.
+
+```{r cox-snell}
+get_cs <- function(fit) colMeans(fit$draws("cox_snell", format = "matrix"))
+
+cs_list <- list(
+  Exponential = get_cs(fit_exp),
+  Weibull     = get_cs(fit_wb),
+  Gompertz    = get_cs(fit_gz)
+)
+
+par(mfrow = c(1, 3), mar = c(4, 4, 2.5, 1))
+for (nm in names(cs_list)) {
+  r     <- cs_list[[nm]]
+  km_cs <- survfit(Surv(r, stan_surv$event) ~ 1)
+  t_ref <- seq(0, max(r), length.out = 200)
+  plot(km_cs, main = nm, xlab = "r = H(t|x)", ylab = "S(r)",
+       col = "steelblue", lwd = 2, cex.main = 0.9)
+  lines(t_ref, exp(-t_ref), col = "red", lty = 2, lwd = 2)
+  legend("topright", c("KM of residuals", "Exp(1) ref"),
+         col = c("steelblue", "red"), lty = c(1, 2), cex = 0.7, bty = "n")
+}
+par(mfrow = c(1, 1))
+```
+
+### 5.3 Survival Curve Overlay — All Three Models vs KM
+
+```{r surv-overlay}
+# Compute posterior survival S(t) for reference patient from all three models
+t_surv <- seq(0, 15, by = 0.25)
+set.seed(42)
+n_samp  <- 300
+
+# Exponential: S(t) = exp(-lambda * t)
+lam_e   <- fit_exp$draws("lambda", format = "matrix") |> as.vector()
+idx_e   <- sample(length(lam_e), n_samp)
+S_exp_ov <- map_dfr(seq_len(n_samp), \(s) {
+  tibble(t = t_surv, model = "Exponential", S = exp(-lam_e[idx_e[s]] * t_surv))
+})
+
+# Weibull: S(t) = exp(-(t/scale)^alpha)
+draws_wb <- fit_wb$draws(format = "df")
+idx_wb   <- sample(nrow(draws_wb), n_samp)
+S_wb_ov  <- map_dfr(seq_len(n_samp), \(s) {
+  row <- draws_wb[idx_wb[s], ]
+  tibble(t = t_surv, model = "Weibull",
+         S = pweibull(t_surv, shape = as.numeric(row[["alpha"]]),
+                      scale = exp(as.numeric(row[["mu"]])), lower.tail = FALSE))
+})
+
+# Gompertz: S(t) = exp(-H(t)), H(t) = (lambda/rho)*(exp(rho*t) - 1)
+lam_g  <- fit_gz$draws("lambda", format = "matrix") |> as.vector()
+rho_g  <- fit_gz$draws("rho",    format = "matrix") |> as.vector()
+idx_gz2 <- sample(length(lam_g), n_samp)
+S_gz_ov <- map_dfr(seq_len(n_samp), \(s) {
+  l <- lam_g[idx_gz2[s]]; r <- rho_g[idx_gz2[s]]
+  H <- if (abs(r) > 1e-6) (l / r) * (exp(r * t_surv) - 1) else l * t_surv
+  tibble(t = t_surv, model = "Gompertz", S = exp(-H))
+})
+
+S_all <- bind_rows(S_exp_ov, S_wb_ov, S_gz_ov) |>
+  group_by(t, model) |>
+  summarise(S_med = median(S, na.rm = TRUE),
+            S_lo  = quantile(S, 0.05, na.rm = TRUE),
+            S_hi  = quantile(S, 0.95, na.rm = TRUE), .groups = "drop")
+```
+
+```{r surv-overlay-plot}
+pal <- c(Exponential = "steelblue", Weibull = "darkorange", Gompertz = "firebrick")
+
+ggplot() +
+  geom_step(data = km_df, aes(x = t, y = S), linewidth = 1.2, colour = "black") +
+  geom_ribbon(data = km_df, aes(x = t, ymin = S_lo, ymax = S_hi),
+              alpha = 0.15, fill = "black") +
+  geom_line(data = S_all, aes(x = t, y = S_med, colour = model), linewidth = 1) +
+  geom_ribbon(data = S_all,
+              aes(x = t, ymin = S_lo, ymax = S_hi, fill = model),
+              alpha = 0.15, colour = NA) +
+  scale_colour_manual(values = pal) +
+  scale_fill_manual(values = pal) +
+  labs(title    = "Posterior Survival Curves: Three PH Models vs Kaplan-Meier",
+       subtitle = "Black = KM (95% CI shaded); coloured = posterior median ± 90% CI (reference patient)",
+       x = "Time (years)", y = "S(t)", colour = "", fill = "") +
+  ylim(0, 1) + theme_minimal()
+```
+
+### 5.4 Hazard Shape Comparison
+
+Overlaying the three posterior hazard functions in a single plot makes the
+differences in $h_0(t)$ assumptions immediately visible:
+
+```{r hazard-comparison}
+# Bind the three hazard data frames created in sections 2–4
+haz_all <- bind_rows(
+  haz_exp_df |> mutate(model = "Exponential"),
+  haz_wb_df  |> mutate(model = "Weibull"),
+  haz_gz_df  |> mutate(model = "Gompertz")
+)
+
+ggplot(haz_all, aes(x = t, y = h_med, colour = model)) +
+  geom_line(linewidth = 1.2) +
+  geom_ribbon(aes(ymin = h_lo, ymax = h_hi, fill = model),
+              alpha = 0.12, colour = NA) +
+  scale_colour_manual(values = pal) +
+  scale_fill_manual(values = pal) +
+  labs(title    = "Posterior Hazard Functions: Exponential vs Weibull vs Gompertz",
+       subtitle = "Reference patient (all covariates = 0). Same data, three different h₀(t) assumptions.",
+       x = "Time (years)", y = "h(t) — instantaneous hazard rate",
+       colour = "", fill = "") +
+  theme_minimal()
+```
+
+### 5.5 Hazard Ratio Summary
+
+```{r hr-comparison}
+hr_exp <- colMeans(fit_exp$draws("HR", format = "matrix"))
+hr_wb  <- colMeans(fit_wb$draws("HR",  format = "matrix"))
+hr_gz  <- colMeans(fit_gz$draws("HR",  format = "matrix"))
+
+tibble(
+  Covariate   = c("Drug (trt)", "Female", "Age (scaled)", "Stage"),
+  `Cox HR`    = round(exp(coef(cox_fit)), 3),
+  Exponential = round(hr_exp, 3),
+  Weibull     = round(hr_wb,  3),
+  Gompertz    = round(hr_gz,  3)
+) |>
+  knitr::kable(caption = "HR Summary: Cox PH vs Three Bayesian PH Models")
+```
+
+**Question 5.1:** Which model wins by LOO-CV?  Is the difference between Weibull and
+Gompertz larger than $2 \times \text{SE}$?
+
+**Question 5.2:** Examining the Cox-Snell residual plots, which model's KM curve deviates
+most from the $\text{Exp}(1)$ reference?  Which models are hardest to distinguish?
+
+**Question 5.3:** In the survival curve overlay, does the Exponential model over- or
+under-estimate survival at early times (< 5 years) compared to the KM?
+
+**Question 5.4:** Looking at the hazard comparison plot, at year 10 the Weibull and
+Gompertz hazards are both substantially higher than Exponential.  How does this relate
+to the LOO-CV and residual results?
+
+**Question 5.5:** Are the HR estimates consistent across all three models?  What does
+consistency of covariate effects across three different baseline hazard shapes imply
+about robustness?
+
+---
+
+## 6. Competing Risks — Cause-Specific Hazards
+
+Until now we combined transplant and death into a single event (`event = 1`).
+But they represent **biologically distinct processes** — the competing risks framework
+models them separately.
+
+### Background
+
+In PBC, the `status` variable has three levels:
+
+| Code | Meaning | Clinical interpretation |
+|------|---------|------------------------|
+| 0 | Censored | Still alive without transplant at study end |
+| 1 | Liver transplant | Treatment — prevents further disease progression |
+| 2 | Death | Primary clinical endpoint |
+
+When modelling death, patients who receive a transplant are **not** simply censored.
+Their liver disease is removed; they are no longer at risk of death *from PBC* after
+transplant.  Treating transplant as censoring overestimates the mortality probability.
+
+The correct framework uses the **Cumulative Incidence Function (CIF)**:
+
+$$F_k(t) = P(T \le t,\;\text{cause} = k) = \int_0^t h_k(s)\,S(s)\,ds$$
+
+where $S(t) = \exp\!\bigl(-H_1(t) - H_2(t)\bigr)$ is the **overall survival** — survival
+free of *any* event.  Crucially:
+
+$$F_1(t) + F_2(t) + S(t) = 1 \quad \text{for all } t$$
+
+This means summing the transplant and death CIFs and the overall survival always gives 1
+— it is a proper probability partition.
+
+> **Naive mistake to avoid:** Using $1 - \hat{S}(t)$ (from a Kaplan-Meier treating the
+> competing event as censored) gives the **cause-specific net probability** — what would
+> happen in a world where the competing event cannot occur.  The CIF gives the **crude
+> probability** — what actually happens in the real world where both events compete.
+> For clinical decision-making, the CIF is almost always what you want.
+
+### Competing risks data
+
+```{r cr-data}
+source("../R/data_prep.R")   # stan_competing already available; re-source to be safe
+
+cat("Cause 0 (censored)   :", sum(stan_competing$cause == 0), "\n")
+cat("Cause 1 (transplant) :", sum(stan_competing$cause == 1), "\n")
+cat("Cause 2 (death)      :", sum(stan_competing$cause == 2), "\n\n")
+
+n_cr <- stan_competing$N
+cat("Event rate — transplant:", round(mean(stan_competing$cause == 1), 3), "\n")
+cat("Event rate — death     :", round(mean(stan_competing$cause == 2), 3), "\n")
+```
+
+### Empirical CIF (Aalen-Johansen estimator)
+
+The **Aalen-Johansen estimator** is the non-parametric estimate of the CIF — analogous
+to Kaplan-Meier but accounting for competing events at each failure time.
+
+```{r cr-km}
+cr_df <- tibble(
+  time  = stan_competing$t_event,
+  cause = factor(stan_competing$cause, levels = 0:2,
+                 labels = c("censored", "transplant", "death"))
+)
+
+aj_fit <- survfit(Surv(time, cause) ~ 1, data = cr_df)
+
+cif_df <- bind_rows(
+  tibble(time = aj_fit$time, CIF = aj_fit$pstate[, 2], cause = "Transplant (cause 1)"),
+  tibble(time = aj_fit$time, CIF = aj_fit$pstate[, 3], cause = "Death (cause 2)")
+)
+
+ggplot(cif_df, aes(x = time, y = CIF, colour = cause)) +
+  geom_step(linewidth = 1.1) +
+  scale_colour_manual(values = c("Transplant (cause 1)" = "steelblue",
+                                 "Death (cause 2)"      = "firebrick")) +
+  labs(title    = "Aalen-Johansen Cumulative Incidence Functions",
+       subtitle = "F₁(t) + F₂(t) + S(t) = 1 at every time point",
+       x = "Time (years)", y = "CIF", colour = "") +
+  ylim(0, 0.6) + theme_minimal()
+```
+
+**Question 6.1:** At year 10, approximately what fraction of patients have died?  What
+fraction has received a transplant?  What fraction is still event-free?  Do these three
+fractions add to 1?
+
+**Question 6.2:** Why does neither CIF reach 1.0?  (Hint: there is always a non-zero
+probability of remaining event-free.)
+
+---
+
+### Fitting the Bayesian competing risks model
+
+The model uses **Gompertz cause-specific hazards**:
+$$h_k(t \mid \mathbf{x}_i) = \lambda_k\, e^{\rho_k t}\,\exp(\mathbf{x}_i'\boldsymbol{\gamma}_k),
+\quad k = 1 \text{ (transplant)},\; 2 \text{ (death)}$$
+
+Each cause has its own $\lambda_k$, $\rho_k$, and $\boldsymbol{\gamma}_k$.  The
+log-likelihood contributes $-H_1(T_i) - H_2(T_i)$ (overall survival term) to every
+observation, plus the density of the observed cause for events.
+
+```{r cr-fit}
+mod_cr <- cmdstan_model("../stan/surv_competing_risks.stan")
+
+fit_cr <- mod_cr$sample(
+  data            = stan_competing,
+  seed            = 123,
+  chains          = 4,
+  parallel_chains = 4,
+  iter_warmup     = 1000,
+  iter_sampling   = 1000,
+  adapt_delta     = 0.95,
+  refresh         = 500
+)
+
+fit_cr$diagnostic_summary()
+```
+
+### Posterior summary
+
+```{r cr-summary}
+fit_cr$summary(c("lambda", "rho", "increasing_hazard")) |>
+  select(variable, mean, sd, q5, q95, rhat, ess_bulk) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |>
+  knitr::kable(caption = "Competing Risks: Posterior Summary (baseline hazard per cause)")
+```
+
+**Interpreting the output:**
+
+- `lambda[1]`, `lambda[2]`: initial hazard rates for transplant and death respectively.
+  A higher $\hat\lambda_2$ means death starts at a higher rate than transplant at $t = 0$.
+- `rho[1]`, `rho[2]`: hazard growth rates per cause.  Both positive means both risks
+  accelerate over time, though potentially at different rates.
+- `increasing_hazard[1]` $= P(\rho_1 > 0 \mid \mathbf{y})$ and
+  `increasing_hazard[2]` $= P(\rho_2 > 0 \mid \mathbf{y})$:
+  posterior probabilities that each cause's hazard increases.
+
+### Convergence diagnostics
+
+```{r cr-trace}
+mcmc_trace(
+  fit_cr$draws(c("lambda[1]", "lambda[2]", "rho[1]", "rho[2]")),
+  facet_args = list(ncol = 2)
+) +
+  labs(title    = "Competing Risks: Trace Plots (baseline hazard parameters)",
+       subtitle = "Each cause has its own lambda and rho — both should converge independently")
+```
+
+### Posterior probability of increasing hazard per cause
+
+```{r cr-increasing}
+ih <- fit_cr$draws("increasing_hazard", format = "matrix")
+cat("P(rho_1 > 0 | data) — transplant hazard increasing:", round(mean(ih[, 1]), 3), "\n")
+cat("P(rho_2 > 0 | data) — death hazard increasing     :", round(mean(ih[, 2]), 3), "\n")
+```
+
+**Question 6.3:** Does the transplant hazard increase or decrease with time?
+Clinically, would you expect increasing transplant rates over disease duration, or
+do most urgent referrals happen at particular disease stages?
+
+### Cause-specific hazard ratios
+
+```{r cr-hr}
+hr_draws     <- fit_cr$draws("HR", format = "matrix")
+P_cr_hr      <- stan_competing$P
+covar_names_cr <- c("trt", "female", "age_per10yr", "stage")
+
+hr_summary <- tibble(
+  Covariate = rep(covar_names_cr, 2),
+  Cause     = rep(c("Transplant", "Death"), each = P_cr_hr),
+  HR_mean   = round(colMeans(hr_draws), 3),
+  HR_lo     = round(apply(hr_draws, 2, quantile, 0.05), 3),
+  HR_hi     = round(apply(hr_draws, 2, quantile, 0.95), 3)
+)
+
+knitr::kable(hr_summary,
+             caption = "Cause-Specific Hazard Ratios (posterior mean, 90% CI)")
+```
+
+**Question 6.4:** Is the age HR larger for transplant or death?  Does this make clinical
+sense — for example, are older patients less likely to be referred for transplant
+(higher age HR for death) or more likely to die before getting one?
+
+### Posterior CIF from Stan draws
+
+The posterior CIF is computed by numerically integrating the Gompertz cause-specific
+hazards over posterior draws (trapezoidal rule):
+
+```{r cr-cif-posterior}
+lam_cr <- fit_cr$draws("lambda", format = "matrix")
+rho_cr <- fit_cr$draws("rho",    format = "matrix")
+
+t_grid_cr <- seq(0, 12, length.out = 100)
+n_cr_d    <- nrow(lam_cr)
+set.seed(42); idx_cif <- sample(n_cr_d, 500)
+
+cif_post <- map_dfr(1:2, function(k) {
+  map_dfr(idx_cif, function(s) {
+    lam   <- lam_cr[s, k]; rho_k <- rho_cr[s, k]
+    H_k   <- if (abs(rho_k) > 1e-7)
+               (lam / rho_k) * (exp(rho_k * t_grid_cr) - 1)
+             else lam * t_grid_cr
+    k2    <- 3 - k
+    lam2  <- lam_cr[s, k2]; rho2 <- rho_cr[s, k2]
+    H_k2  <- if (abs(rho2) > 1e-7)
+               (lam2 / rho2) * (exp(rho2 * t_grid_cr) - 1)
+             else lam2 * t_grid_cr
+    S_all <- exp(-H_k - H_k2)
+    h_k   <- lam * exp(rho_k * t_grid_cr)
+    dt    <- c(0, diff(t_grid_cr))
+    F_k   <- cumsum(h_k * S_all * dt)
+    tibble(t = t_grid_cr, CIF = F_k, cause = k, draw = s)
+  })
+})
+
+cif_post_sum <- cif_post |>
+  group_by(t, cause) |>
+  summarise(CIF_med = median(CIF),
+            CIF_lo  = quantile(CIF, 0.05),
+            CIF_hi  = quantile(CIF, 0.95), .groups = "drop") |>
+  mutate(cause_label = if_else(cause == 1, "Transplant", "Death"))
+
+ggplot(cif_post_sum, aes(x = t, y = CIF_med, colour = cause_label,
+                          fill = cause_label)) +
+  geom_line(linewidth = 1.1) +
+  geom_ribbon(aes(ymin = CIF_lo, ymax = CIF_hi), alpha = 0.25, colour = NA) +
+  scale_colour_manual(values = c("Transplant" = "steelblue", "Death" = "firebrick")) +
+  scale_fill_manual(values   = c("Transplant" = "steelblue", "Death" = "firebrick")) +
+  labs(title    = "Posterior Cumulative Incidence Functions",
+       subtitle = "Reference patient (all covariates = 0); 90% credible band",
+       x = "Time (years)", y = "CIF", colour = "", fill = "") +
+  ylim(0, 0.65) + theme_minimal()
+```
+
+**Question 6.5:** Do the Bayesian posterior CIF curves broadly agree with the
+Aalen-Johansen empirical estimates?  What might cause small discrepancies (consider
+the reference patient vs.\ the average patient in the data)?
+
+### Comparison with Rizopoulos / `coxph()` per cause
+
+```{r cr-rizopoulos}
+# Build data frame with all 4 covariates from X matrix
+pbc_cr_df <- tibble(
+  t_event     = stan_competing$t_event,
+  cause       = stan_competing$cause,
+  trt         = stan_competing$X[, 1],
+  female      = stan_competing$X[, 2],
+  age_per10yr = stan_competing$X[, 3],
+  stage       = stan_competing$X[, 4]
+)
+
+# Cause-specific Cox: treat the other cause as censored
+cox_cause1 <- coxph(Surv(t_event, cause == 1) ~ trt + female + age_per10yr + stage,
+                    data = pbc_cr_df)
+cox_cause2 <- coxph(Surv(t_event, cause == 2) ~ trt + female + age_per10yr + stage,
+                    data = pbc_cr_df)
+
+cat("=== Cause 1 (Transplant) — cause-specific Cox ===\n")
+print(summary(cox_cause1)$coefficients[, c("coef", "exp(coef)", "se(coef)")])
+cat("\n=== Cause 2 (Death) — cause-specific Cox ===\n")
+print(summary(cox_cause2)$coefficients[, c("coef", "exp(coef)", "se(coef)")])
+
+stan_cr_hr <- fit_cr$summary("HR") |> select(variable, mean, q5, q95)
+
+comparison_cr <- tibble(
+  Covariate          = rep(c("Drug (trt)", "Female", "Age per 10yr", "Stage"), 2),
+  Cause              = rep(c("Transplant", "Death"), each = 4),
+  `Cox HR`           = round(c(exp(coef(cox_cause1)), exp(coef(cox_cause2))), 3),
+  `Stan Gompertz HR` = round(stan_cr_hr$mean, 3),
+  `Stan 90% CI`      = paste0("[", round(stan_cr_hr$q5, 3), ", ",
+                                   round(stan_cr_hr$q95, 3), "]")
+)
+knitr::kable(comparison_cr,
+             caption = "Competing Risks: cause-specific Cox vs Bayesian Gompertz HRs")
+```
+
+**Question 6.6:** Does the drug effect differ substantially between the transplant and
+death causes?  If D-penicillamine slows disease progression, what direction of effect
+on each cause would you predict, and does the data support this?
+
+---
+
+## Summary
+
+| Model | Hazard $h_0(t)$ | Key parameter | Joint model ready? |
+|-------|----------------|---------------|-------------------|
+| **Exponential** | Constant $\lambda$ | Rate $\lambda > 0$ | Yes |
+| **Weibull** | Power-law $\propto t^{\alpha-1}$ | Shape $\alpha$; test $P(\alpha>1)$ | Yes |
+| **Gompertz** | Exponential $\lambda e^{\rho t}$ | Growth rate $\rho$; test $P(\rho>0)$ | **Yes — chosen for Session 3** |
+| **Competing Risks** | Per-cause Gompertz | $\lambda_k, \rho_k, \boldsymbol{\gamma}_k$ | — |
+
+**Key takeaways:**
+
+1. **All three PH models give consistent HRs** that agree with the Cox semi-parametric
+   model — the choice of baseline hazard shape does not substantially distort the
+   covariate effect estimates for PBC.
+
+2. **Both Weibull** ($\hat\alpha \approx 1.45$, $P(\alpha>1) > 0.999$) **and Gompertz**
+   ($\hat\rho \approx 0.086$, $P(\rho>0) \approx 0.998$) confirm that PBC hazard
+   increases with disease duration, consistent with progressive liver damage.
+
+3. **Gompertz is chosen for Session 3** because its cumulative hazard has a closed-form
+   solution ($H(t) = \frac{\lambda}{\rho}(e^{\rho t}-1)$), avoiding numerical quadrature
+   inside Stan when evaluating the joint model likelihood.
+
+4. **Competing risks** reveal that transplant and death have different covariate profiles —
+   a pooled model conflates the two.  The CIF (not $1-S(t)$) is the correct probability
+   of each event in the presence of competition.
